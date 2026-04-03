@@ -244,17 +244,48 @@ Choose a cohesive color palette that matches the user's topic. Include:
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  * { @apply border-border; }
-  body { @apply bg-background text-foreground font-sans antialiased; }
-}
+/* IMPORTANT: Do NOT use @apply inside @layer blocks — it breaks PostCSS compilation.
+   Write plain CSS values instead. */
 
-@layer components {
-  .glass { @apply bg-white/80 backdrop-blur-xl border border-white/20; }
-  .gradient-primary { @apply bg-gradient-to-br from-primary to-primary/80; }
-  .text-balance { text-wrap: balance; }
-  .animate-in { animation: fade-in 0.6s ease-out forwards; }
+* { border-color: #e2e8f0; }
+body {
+  background-color: #ffffff;
+  color: #0f172a;
+  font-family: var(--font-inter), Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
+html { scroll-behavior: smooth; }
+
+.glass {
+  background-color: rgba(255,255,255,0.8);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255,255,255,0.2);
+}
+.gradient-primary { background: linear-gradient(to bottom right, var(--color-primary), rgba(var(--color-primary-rgb),0.8)); }
+.gradient-secondary { background: linear-gradient(to bottom right, var(--color-secondary), rgba(var(--color-secondary-rgb),0.8)); }
+.text-balance { text-wrap: balance; }
+.animate-in { animation: fade-in 0.6s ease-out forwards; }
+.animate-slide-up { animation: slide-up 0.6s ease-out forwards; }
+.btn-primary {
+  background-color: var(--color-primary, #0ea5e9);
+  color: #ffffff;
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.5rem;
+  font-weight: 600;
+  transition: all 0.3s;
+}
+.btn-primary:hover { opacity: 0.9; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+.btn-outline {
+  border: 2px solid var(--color-primary, #0ea5e9);
+  color: var(--color-primary, #0ea5e9);
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.5rem;
+  font-weight: 600;
+  transition: all 0.3s;
+}
+.btn-outline:hover { background-color: var(--color-primary, #0ea5e9); color: #ffffff; }
 \`\`\`
 
 ### Component Design Principles
@@ -289,10 +320,10 @@ const REQUIRED_FILE_STRUCTURE = `
 - tsconfig.json (Next.js standard)
 - next.config.mjs (with images.remotePatterns for picsum.photos)
 - tailwind.config.ts (with ALL custom colors, fonts, animations)
-- postcss.config.mjs
+- postcss.config.js (CommonJS format with module.exports — NOT .mjs)
 - src/app/layout.tsx (root layout with Inter font, metadata)
 - src/app/page.tsx (home page composing all sections)
-- src/app/globals.css (Tailwind directives + custom layers)
+- src/app/globals.css (Tailwind directives + plain CSS custom classes — NO @apply in @layer blocks)
 - src/types/index.ts (TypeScript interfaces)
 - src/data/site.ts (brand config, nav links)
 - src/data/products.ts (product data)
@@ -608,17 +639,14 @@ function mockCodeGen(): GeneratedFile[] {
       ].join("\n"),
     },
     {
-      filePath: "postcss.config.mjs",
+      filePath: "postcss.config.js",
       content: [
-        "/** @type {import('postcss-load-config').Config} */",
-        "const config = {",
+        "module.exports = {",
         "  plugins: {",
         "    tailwindcss: {},",
         "    autoprefixer: {},",
         "  },",
         "};",
-        "",
-        "export default config;",
         "",
       ].join("\n"),
     },
@@ -742,16 +770,38 @@ function mockCodeGen(): GeneratedFile[] {
         "@tailwind components;",
         "@tailwind utilities;",
         "",
-        "@layer base {",
-        "  * { @apply border-border; }",
-        "  body { @apply bg-background text-foreground font-sans antialiased; }",
+        "/* Do NOT use @apply inside @layer — use plain CSS */",
+        "* { border-color: #e2e8f0; }",
+        "body {",
+        "  background-color: #ffffff;",
+        "  color: #0f172a;",
+        "  font-family: var(--font-inter), Inter, system-ui, sans-serif;",
+        "  -webkit-font-smoothing: antialiased;",
+        "  -moz-osx-font-smoothing: grayscale;",
         "}",
+        "html { scroll-behavior: smooth; }",
         "",
-        "@layer components {",
-        "  .glass { @apply bg-white/80 backdrop-blur-xl border border-white/20; }",
-        "  .gradient-primary { @apply bg-gradient-to-br from-primary to-primary/80; }",
-        "  .text-balance { text-wrap: balance; }",
+        ".glass {",
+        "  background-color: rgba(255,255,255,0.8);",
+        "  backdrop-filter: blur(24px);",
+        "  -webkit-backdrop-filter: blur(24px);",
+        "  border: 1px solid rgba(255,255,255,0.2);",
         "}",
+        ".gradient-primary { background: linear-gradient(to bottom right, #0ea5e9, rgba(14,165,233,0.8)); }",
+        ".text-balance { text-wrap: balance; }",
+        ".animate-slide-up { animation: slide-up 0.6s ease-out forwards; }",
+        ".btn-primary {",
+        "  background-color: #0ea5e9;",
+        "  color: #ffffff;",
+        "  padding: 0.75rem 1.5rem;",
+        "  border-radius: 0.5rem;",
+        "  font-weight: 600;",
+        "  transition: all 0.3s;",
+        "}",
+        ".btn-primary:hover { opacity: 0.9; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }",
+        "",
+        "@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }",
+        "@keyframes slide-up { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }",
         "",
       ].join("\n"),
     },
@@ -1234,7 +1284,7 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
     const priorityOrder = (fp: string): number => {
       if (fp.includes("types/")) return 0;
       if (fp.includes("data/")) return 1;
-      if (fp.endsWith("package.json") || fp.endsWith("tsconfig.json") || fp.endsWith("next.config.mjs") || fp.endsWith("tailwind.config.ts") || fp.endsWith("postcss.config.mjs")) return 2;
+      if (fp.endsWith("package.json") || fp.endsWith("tsconfig.json") || fp.endsWith("next.config.mjs") || fp.endsWith("tailwind.config.ts") || fp.endsWith("postcss.config.js") || fp.endsWith("postcss.config.mjs")) return 2;
       if (fp.endsWith("index.html") || fp.includes("main.ts") || fp.includes("App.ts")) return 3;
       if (fp.includes("hooks/") || fp.includes("utils/") || fp.includes("ui/")) return 4;
       if (fp.includes("components/")) return 5;
@@ -1297,9 +1347,11 @@ CRITICAL rules (violating these causes build failures):
   images: { remotePatterns: [{ protocol: "https", hostname: "picsum.photos" }] }
 - tailwind.config.ts MUST define ALL custom color tokens in theme.extend.colors
 - globals.css MUST have @tailwind base; @tailwind components; @tailwind utilities; + @layer base with body styles
+- postcss.config.js MUST use CommonJS (module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } })
 - package.json scripts: { "dev": "next dev", "build": "next build", "start": "next start" }
 - Every file must be COMPLETE — no TODOs, no placeholders, no "..." shortcuts
 - Data files must export typed arrays matching interfaces in types/index.ts
+- IMPORT/EXPORT CONSISTENCY: If a component imports { foo, bar } from "@/data/xyz", then "@/data/xyz" MUST export both foo and bar. Check previously generated data files (shown in context above) and ONLY import symbols that actually exist. If you need new data, ADD exports to the data file in this batch.
 - Do NOT use React.FC — use plain function components with typed props
 - For images: use div with bg-cover bg-center + inline style backgroundImage with picsum.photos URLs
 - Do NOT use Next.js <Image> component — use div backgrounds for reliable styling
@@ -1374,38 +1426,59 @@ async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>
       };
     }
 
-    // Ask LLM to fix — only send relevant files to reduce token usage
+    // Ask LLM to fix — send relevant files + import targets to reduce token usage
     log("INFO", "Requesting build fix from LLM…");
 
     // Extract file paths mentioned in error output
     const errorFileMatches = build.stdout.match(/src\/[^\s:(]+/g) ?? [];
     const errorFilePaths = [...new Set(errorFileMatches)];
 
+    // Also extract import targets from error messages (e.g., "is not exported from '@/data/site'")
+    const importTargetMatches = build.stdout.match(/'@\/([^']+)'/g) ?? [];
+    const importTargetPaths = importTargetMatches.map((m) => "src/" + m.replace(/@\//g, "").replace(/'/g, ""));
+
     const allFiles = await listFilesSafe(ws);
     const sourceFiles: { path: string; content: string }[] = [];
+    const added = new Set<string>();
+
+    const addFile = async (fp: string) => {
+      if (added.has(fp)) return;
+      added.add(fp);
+      const content = await readFileSafe(ws, fp);
+      sourceFiles.push({ path: fp, content });
+    };
+
     for (const fp of allFiles) {
       if (fp.startsWith("node_modules")) continue;
-      // Always include config files, only include src files mentioned in errors
-      const isConfig = fp.endsWith("package.json") || fp.endsWith("tsconfig.json") || fp.endsWith("next.config.mjs") || fp.endsWith("tailwind.config.ts");
+
+      // Always include config files
+      const isConfig = fp.endsWith("package.json") || fp.endsWith("tsconfig.json") || fp.endsWith("next.config.mjs") || fp.endsWith("tailwind.config.ts") || fp.endsWith("postcss.config.js");
+      // Include files mentioned in errors
       const isErrorFile = errorFilePaths.some((ef) => fp.includes(ef) || ef.includes(fp));
-      if (isConfig || isErrorFile) {
-        const content = await readFileSafe(ws, fp);
-        sourceFiles.push({ path: fp, content });
+      // Include import target modules (e.g., @/data/site → src/data/site.ts)
+      const isImportTarget = importTargetPaths.some((it) => fp.startsWith(it));
+      // Always include all data files (common source of missing exports)
+      const isDataFile = fp.includes("/data/") && (fp.endsWith(".ts") || fp.endsWith(".tsx"));
+
+      if (isConfig || isErrorFile || isImportTarget || isDataFile) {
+        await addFile(fp);
       }
     }
 
-    // If no specific files found from errors, fall back to all non-test src files (limited)
+    // If still too few files, include all src non-test files
     if (sourceFiles.length <= 3) {
       for (const fp of allFiles) {
         if (fp.startsWith("node_modules")) continue;
         if (fp.includes("__tests__")) continue;
-        if (sourceFiles.some((s) => s.path === fp)) continue;
+        if (added.has(fp)) continue;
         if (fp.endsWith(".ts") || fp.endsWith(".tsx") || fp.endsWith(".json") || fp.endsWith(".html") || fp.endsWith(".css")) {
-          const content = await readFileSafe(ws, fp);
-          sourceFiles.push({ path: fp, content });
+          await addFile(fp);
         }
       }
     }
+
+    // Detect import/export mismatch pattern
+    const isImportMismatch = /is not exported from|has no exported member|cannot find module/i.test(build.stdout);
 
     const fixPrompt = `[FIX_BUILD]
 The following project has a build error. Analyze and provide fixed file contents.
@@ -1414,6 +1487,13 @@ Build command: ${PM} run build
 Error output:
 ${build.stdout}
 
+${isImportMismatch ? `IMPORTANT: This is an IMPORT/EXPORT MISMATCH error.
+- Check what the component is trying to import (the symbol name)
+- Check what the data/module file actually exports
+- Fix by ADDING the missing exports to the data file with appropriate content
+- Do NOT just remove imports — the component needs that data to render
+- Make sure the exported data shape matches how it's used in the component
+` : ""}
 Project files:
 ${JSON.stringify(sourceFiles, null, 2)}
 
