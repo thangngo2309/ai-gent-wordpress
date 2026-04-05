@@ -20,10 +20,11 @@
 
 import "dotenv/config";
 import * as fs from "node:fs/promises";
-import { Dirent } from "node:fs";
+import * as http from "node:http";
+import { Dirent, existsSync } from "node:fs";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { execSync } from "node:child_process";
+import { execSync, spawn, ChildProcess } from "node:child_process";
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  TYPES
@@ -98,10 +99,20 @@ interface SharedContext {
   errors: string[];
 }
 
+type ReviewAction = "approve" | "change" | "regenerate" | "quit";
+
+interface ReviewChoice {
+  action: ReviewAction;
+  feedback?: string;
+}
+
+type AgentKind = "analysis" | "spec" | "codegen" | "build" | "test" | "commit";
+
 interface AgentStep {
   name: string;
   description: string;
   run: (ctx: SharedContext) => Promise<AgentResult>;
+  kind: AgentKind;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1389,6 +1400,134 @@ CRITICAL rules (violating these causes build failures):
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  RUNTIME CHECK — Start dev server, fetch pages, capture errors
+// ═════════════════════════════════════════════════════════════════════════════
+
+interface RuntimeCheckResult {
+  success: boolean;
+  errors: string[];
+  serverOutput: string;
+}
+
+/** Fetch a URL and return { status, body } */
+function httpGet(url: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (res) => {
+      let body = "";
+      res.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+    });
+    req.on("error", reject);
+    req.setTimeout(30_000, () => { req.destroy(new Error("HTTP request timeout")); });
+  });
+}
+
+/**
+ * Start the Next.js dev server, fetch key pages, capture runtime errors.
+ * Returns errors found in server output or HTTP 500 responses.
+ */
+async function runtimeCheck(projectDir: string): Promise<RuntimeCheckResult> {
+  const PORT = 3457;
+  const errors: string[] = [];
+  let serverOutput = "";
+  let serverReady = false;
+
+  const proc = spawn(PM, ["run", "dev"], {
+    cwd: projectDir,
+    stdio: "pipe",
+    env: { ...process.env, PORT: String(PORT), NODE_ENV: "development" },
+  });
+
+  proc.stdout?.on("data", (d: Buffer) => { serverOutput += d.toString(); });
+  proc.stderr?.on("data", (d: Buffer) => { serverOutput += d.toString(); });
+
+  // Wait for server to be ready (max 30s)
+  const startTime = Date.now();
+  while (Date.now() - startTime < 30_000) {
+    if (serverOutput.includes("Ready") || serverOutput.includes("ready on") || serverOutput.includes("started server")) {
+      serverReady = true;
+      break;
+    }
+    await sleep(1000);
+  }
+
+  if (!serverReady) {
+    proc.kill("SIGTERM");
+    return { success: false, errors: ["Dev server failed to start within 30s"], serverOutput };
+  }
+
+  await sleep(2000);
+
+  // Discover static pages to test
+  const pagesToTest = ["/"];
+  try {
+    const appDir = path.join(projectDir, "src", "app");
+    const entries = await fs.readdir(appDir, { withFileTypes: true, recursive: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith("[") && !entry.name.startsWith("_")) {
+        const parentPath = (entry as Dirent & { parentPath?: string }).parentPath ?? appDir;
+        const relPath = path.relative(appDir, path.join(parentPath, entry.name));
+        if (relPath && relPath !== "." && !relPath.includes("[")) {
+          pagesToTest.push("/" + relPath.replace(/\\/g, "/"));
+        }
+      }
+    }
+  } catch { /* just test homepage */ }
+
+  log("INFO", `Runtime check: testing ${pagesToTest.length} page(s): ${pagesToTest.join(", ")}`);
+
+  for (const pagePath of pagesToTest) {
+    try {
+      const outputBefore = serverOutput.length;
+      const res = await httpGet(`http://localhost:${PORT}${pagePath}`);
+      await sleep(1500);
+      const newOutput = serverOutput.slice(outputBefore);
+
+      if (res.status === 500) {
+        const typeErrorMatch = newOutput.match(/(TypeError|ReferenceError|SyntaxError):\s+(.+?)(?:\n|$)/);
+        const fileMatch = newOutput.match(/(src\/[^\s]+)\s+\((\d+):(\d+)\)/);
+
+        let errorDetail = `Page "${pagePath}" returned HTTP 500.`;
+        if (typeErrorMatch) errorDetail += ` ${typeErrorMatch[1]}: ${typeErrorMatch[2]}`;
+        if (fileMatch) errorDetail += ` at ${fileMatch[1]}:${fileMatch[2]}:${fileMatch[3]}`;
+        if (newOutput) errorDetail += `\n\nServer output:\n${newOutput.slice(0, 3000)}`;
+
+        errors.push(errorDetail);
+        log("WARN", `Runtime error on ${pagePath}: HTTP 500`);
+      } else if (res.status >= 400 && res.status !== 404) {
+        errors.push(`Page "${pagePath}" returned HTTP ${res.status}`);
+      } else {
+        log("INFO", `Runtime check: ${pagePath} → HTTP ${res.status} ✓`);
+      }
+    } catch (fetchErr: unknown) {
+      const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      errors.push(`Failed to fetch "${pagePath}": ${msg}`);
+    }
+  }
+
+  // Scan full server output for uncaught errors
+  const runtimePatterns = [
+    /⨯\s+(src\/[^\n]+)/g,
+    /TypeError:\s+([^\n]+)/g,
+    /ReferenceError:\s+([^\n]+)/g,
+    /Error:\s+Cannot read properties of (undefined|null)[^\n]*/g,
+  ];
+
+  for (const pat of runtimePatterns) {
+    let m;
+    while ((m = pat.exec(serverOutput)) !== null) {
+      const errText = m[0].trim();
+      if (!errors.some((e) => e.includes(errText.slice(0, 50)))) {
+        errors.push(`Server log: ${errText}`);
+      }
+    }
+  }
+
+  proc.kill("SIGTERM");
+  return { success: errors.length === 0, errors, serverOutput };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  AGENT 4 — BUILD & AUTO-FIX (retry loop, max 5 attempts)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1405,14 +1544,111 @@ async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>
   }
   log("INFO", "Dependencies installed");
 
-  // Step 2: build with retries
+  // Step 2: build + runtime check with retries
+  const RUNTIME_MAX_RETRIES = 3;
+
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     log("INFO", `Build attempt ${attempt}/${MAX_RETRIES}…`);
     const build = execSafe(`${PM} run build`, ws);
     ctx.buildLogs.push(build.stdout);
 
     if (build.success) {
-      log("INFO", "Build succeeded");
+      log("INFO", "Build succeeded — running runtime check…");
+
+      // Step 3: runtime check — start dev server and fetch pages
+      let runtimeOk = false;
+      for (let rtAttempt = 1; rtAttempt <= RUNTIME_MAX_RETRIES; rtAttempt++) {
+        log("INFO", `Runtime check attempt ${rtAttempt}/${RUNTIME_MAX_RETRIES}…`);
+        const rt = await runtimeCheck(ws);
+
+        if (rt.success) {
+          log("INFO", "Runtime check passed — all pages render without errors");
+          runtimeOk = true;
+          break;
+        }
+
+        log("WARN", `Runtime errors found (attempt ${rtAttempt}):`, { errors: rt.errors.slice(0, 3) });
+
+        if (rtAttempt === RUNTIME_MAX_RETRIES) {
+          log("WARN", `Runtime check failed after ${RUNTIME_MAX_RETRIES} attempts — proceeding anyway`);
+          // Don't block the pipeline, just warn — user can fix via interactive review
+          break;
+        }
+
+        // Send runtime errors to LLM for fix
+        log("INFO", "Requesting runtime fix from LLM…");
+
+        // Gather files mentioned in errors
+        const errorFileMatches = rt.errors.join("\n").match(/src\/[^\s:(]+/g) ?? [];
+        const errorFiles = [...new Set(errorFileMatches)];
+
+        const allFiles = await listFilesSafe(ws);
+        const sourceFiles: { path: string; content: string }[] = [];
+        const added = new Set<string>();
+
+        for (const fp of allFiles) {
+          if (fp.startsWith("node_modules") || fp.startsWith(".next")) continue;
+          const isErrorFile = errorFiles.some((ef) => fp.includes(ef) || ef.includes(fp));
+          const isDataFile = fp.includes("/data/") && (fp.endsWith(".ts") || fp.endsWith(".tsx"));
+          const isTypeFile = fp.includes("/types/") && (fp.endsWith(".ts") || fp.endsWith(".tsx"));
+
+          if ((isErrorFile || isDataFile || isTypeFile) && !added.has(fp)) {
+            added.add(fp);
+            sourceFiles.push({ path: fp, content: await readFileSafe(ws, fp) });
+          }
+        }
+
+        const rtFixPrompt = `[FIX_RUNTIME_ERROR]
+The Next.js project builds successfully but crashes at runtime when pages are loaded.
+
+Runtime errors:
+${rt.errors.map((e, i) => `${i + 1}. ${e}`).join("\n\n")}
+
+Relevant source files:
+${JSON.stringify(sourceFiles, null, 2)}
+
+Common causes:
+- Accessing properties of undefined (e.g., array[index] where index is out of bounds)
+- Using data before it's loaded or initialized
+- Missing null/undefined checks for optional data
+- Type mismatch between data files and component usage
+- Calling .map() on undefined arrays
+
+RULES:
+- Fix the root cause, don't just add try/catch
+- Ensure all data arrays are initialized
+- Add proper null checks where data might be undefined
+- Make sure component props match the data shape
+
+Respond with JSON:
+{
+  "fixes": [
+    { "filePath": "path/to/file", "content": "complete corrected content" }
+  ],
+  "explanation": "What was wrong and how it was fixed"
+}`;
+
+        const rtFix = (await callLLM(rtFixPrompt)) as BuildFixResponse;
+        log("INFO", `Runtime fix: ${rtFix.explanation}`);
+
+        for (const f of rtFix.fixes) {
+          await writeFileSafe(ws, f.filePath, f.content);
+        }
+
+        // Rebuild after runtime fix
+        log("INFO", "Rebuilding after runtime fix…");
+        const rebuild = execSafe(`${PM} run build`, ws);
+        if (!rebuild.success) {
+          log("WARN", "Rebuild failed after runtime fix — will retry from build loop");
+          break; // Go back to outer build loop
+        }
+
+        if (rtAttempt < RUNTIME_MAX_RETRIES) {
+          log("INFO", "Waiting 10s before next runtime check…");
+          await sleep(10_000);
+        }
+      }
+
       return { success: true, data: build.stdout };
     }
 
@@ -1594,20 +1830,6 @@ Respond with JSON:
 //  USER INTERACTION
 // ═════════════════════════════════════════════════════════════════════════════
 
-async function askApproval(question: string): Promise<boolean> {
-  if (process.env.AUTO_APPROVE === "true") {
-    log("INFO", `${question} → auto-approved`);
-    return true;
-  }
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = await rl.question(`\n❯ ${question} (y/n): `);
-    return answer.trim().toLowerCase() === "y";
-  } finally {
-    rl.close();
-  }
-}
-
 function displayResult(name: string, result: AgentResult): void {
   const divider = "─".repeat(60);
   console.log(`\n${divider}`);
@@ -1649,6 +1871,393 @@ function displayResult(name: string, result: AgentResult): void {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  REVIEW OUTPUTS — Markdown reports for each agent
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function generateIdeaMd(ctx: SharedContext): Promise<string> {
+  const a = ctx.analysis!;
+  const mdPath = path.join(ctx.workspacePath, "IDEA.md");
+
+  const priorityEmoji = (p: string) =>
+    p === "high" ? "🔴" : p === "medium" ? "🟡" : "🟢";
+
+  const lines = [
+    `# ${a.projectName}`,
+    "",
+    `> ${a.summary}`,
+    "",
+    "## Features",
+    "",
+    "| # | Feature | Description | Priority |",
+    "|---|---------|-------------|----------|",
+    ...a.features.map(
+      (f, i) =>
+        `| ${i + 1} | **${f.name}** | ${f.description} | ${priorityEmoji(f.priority)} ${f.priority} |`
+    ),
+    "",
+    "## Tech Stack",
+    "",
+    `- **Frontend:** ${a.techStack.frontend.join(", ")}`,
+    `- **Backend:** ${a.techStack.backend.length > 0 ? a.techStack.backend.join(", ") : "N/A (static site)"}`,
+    `- **Dev Tools:** ${a.techStack.devtools.join(", ")}`,
+    "",
+    "---",
+    `*Generated by AI Coding Agent — ${new Date().toISOString()}*`,
+    "",
+  ];
+
+  const content = lines.join("\n");
+  await fs.mkdir(ctx.workspacePath, { recursive: true });
+  await writeFileSafe(ctx.workspacePath, "IDEA.md", content);
+  log("INFO", `Wrote IDEA.md to ${mdPath}`);
+
+  // Print to console for review
+  console.log("\n┌─────────────────────────────────────────────────────────┐");
+  console.log("│  📄 IDEA.md — Review the analysis below                │");
+  console.log("└─────────────────────────────────────────────────────────┘");
+  console.log(content);
+
+  return mdPath;
+}
+
+async function generateSpecMd(ctx: SharedContext): Promise<string> {
+  const s = ctx.spec!;
+  const a = ctx.analysis!;
+  const mdPath = path.join(ctx.workspacePath, "SPEC.md");
+
+  // Build file tree from fileStructure
+  const buildTree = (files: FileSpec[]): string => {
+    const sorted = [...files].sort((a, b) => a.filePath.localeCompare(b.filePath));
+    const lines: string[] = [];
+    const seen = new Set<string>();
+
+    for (const f of sorted) {
+      const parts = f.filePath.split("/");
+      let prefix = "";
+      for (let i = 0; i < parts.length - 1; i++) {
+        const dir = parts.slice(0, i + 1).join("/");
+        if (!seen.has(dir)) {
+          seen.add(dir);
+          lines.push(`${"  ".repeat(i)}📁 ${parts[i]}/`);
+        }
+      }
+      prefix = "  ".repeat(parts.length - 1);
+      const ext = path.extname(parts[parts.length - 1]);
+      const icon =
+        ext === ".tsx" || ext === ".ts"
+          ? "📄"
+          : ext === ".css"
+            ? "🎨"
+            : ext === ".json"
+              ? "⚙️"
+              : ext === ".html"
+                ? "🌐"
+                : "📄";
+      lines.push(`${prefix}${icon} ${parts[parts.length - 1]}  — ${f.description}`);
+    }
+    return lines.join("\n");
+  };
+
+  // Build component diagram (ASCII)
+  const componentNames = s.fileStructure
+    .filter((f) => f.filePath.includes("components/"))
+    .map((f) => path.basename(f.filePath, path.extname(f.filePath)));
+
+  const diagram = [
+    "```",
+    "┌─────────────────────────────────────────────┐",
+    "│                  App (layout.tsx)            │",
+    "│  ┌──────────┐ ┌──────────┐ ┌──────────┐     │",
+    ...componentNames.map(
+      (name) => `│  │ ${name.padEnd(8).slice(0, 8)} │                              │`
+    ),
+    "│  └──────────┘ └──────────┘ └──────────┘     │",
+    "│                                             │",
+    "│  Data: src/data/ ──→ Components ──→ Pages   │",
+    "│  Types: src/types/ ──→ Data + Components    │",
+    "└─────────────────────────────────────────────┘",
+    "```",
+  ];
+
+  const lines = [
+    `# Project Specification: ${a.projectName}`,
+    "",
+    `## Architecture`,
+    "",
+    s.architecture,
+    "",
+    "## Component Overview",
+    "",
+    ...diagram,
+    "",
+    "## File Structure",
+    "",
+    "```",
+    buildTree(s.fileStructure),
+    "```",
+    "",
+    "## Build & Test",
+    "",
+    `- **Build:** \`${s.buildScript}\``,
+    `- **Test:** \`${s.testScript}\``,
+    "",
+    s.apiEndpoints.length > 0
+      ? [
+          "## API Endpoints",
+          "",
+          "| Method | Path | Description |",
+          "|--------|------|-------------|",
+          ...s.apiEndpoints.map((e) => `| ${e.method} | ${e.path} | ${e.description} |`),
+          "",
+        ].join("\n")
+      : "",
+    "---",
+    `*Generated by AI Coding Agent — ${new Date().toISOString()}*`,
+    "",
+  ];
+
+  const content = lines.filter(Boolean).join("\n");
+  await writeFileSafe(ctx.workspacePath, "SPEC.md", content);
+  log("INFO", `Wrote SPEC.md to ${mdPath}`);
+
+  // Print to console
+  console.log("\n┌─────────────────────────────────────────────────────────┐");
+  console.log("│  📐 SPEC.md — Review the specification below           │");
+  console.log("└─────────────────────────────────────────────────────────┘");
+  console.log(content);
+
+  return mdPath;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  INTERACTIVE REVIEW — Dev server + change/fix loop
+// ═════════════════════════════════════════════════════════════════════════════
+
+let devServerProcess: ChildProcess | null = null;
+
+function startDevServer(projectDir: string): void {
+  if (devServerProcess) {
+    devServerProcess.kill("SIGTERM");
+    devServerProcess = null;
+  }
+  log("INFO", "Starting dev server (next dev)…");
+  devServerProcess = spawn(PM, ["run", "dev"], {
+    cwd: projectDir,
+    stdio: "pipe",
+    env: { ...process.env, PORT: "3456" },
+  });
+
+  devServerProcess.stdout?.on("data", (d: Buffer) => {
+    const line = d.toString().trim();
+    if (line.includes("Ready") || line.includes("localhost") || line.includes("ready")) {
+      log("INFO", `Dev server: ${line}`);
+    }
+  });
+  devServerProcess.stderr?.on("data", (d: Buffer) => {
+    const line = d.toString().trim();
+    if (line && !line.includes("ExperimentalWarning")) {
+      log("DEBUG", `Dev server stderr: ${line}`);
+    }
+  });
+
+  // Give it time to start
+  log("INFO", "Dev server starting on http://localhost:3456 …");
+}
+
+function stopDevServer(): void {
+  if (devServerProcess) {
+    devServerProcess.kill("SIGTERM");
+    devServerProcess = null;
+    log("INFO", "Dev server stopped");
+  }
+}
+
+async function askAgentReview(kind: AgentKind): Promise<ReviewChoice> {
+  if (process.env.AUTO_APPROVE === "true") {
+    log("INFO", "Auto-approved (AUTO_APPROVE=true)");
+    return { action: "approve" };
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const hints: Record<AgentKind, string[]> = {
+      analysis: [
+        '    "add a blog section to the features"',
+        '    "change the tech stack to use Vue instead of React"',
+        '    "add user authentication as a high priority feature"',
+      ],
+      spec: [
+        '    "add a FAQ component to the file structure"',
+        '    "add a data file for testimonials"',
+        '    "remove the contact form, add a chatbot instead"',
+      ],
+      codegen: [
+        '    "change the hero background color to dark blue"',
+        '    "make the header sticky with blur effect"',
+        '    "change all text content to English"',
+      ],
+      build: [
+        '    "fix the product cards — images are too small"',
+        '    "add more spacing between sections"',
+        '    "change the font size of headings"',
+      ],
+      test: [
+        '    "add a test for the contact form validation"',
+        '    "skip the failing test for now"',
+      ],
+      commit: [
+        '    "change the commit message to be more descriptive"',
+      ],
+    };
+
+    const hasDevServer = kind === "build" || kind === "codegen";
+
+    console.log("\n┌─────────────────────────────────────────────────────────┐");
+    if (hasDevServer) {
+      console.log("│  🔍 Review your project at http://localhost:3456       │");
+      console.log("├─────────────────────────────────────────────────────────┤");
+    }
+    console.log("│  [a] ✅ Approve — continue to next step               │");
+    console.log("│  [c] ✏️  Change — request modifications                │");
+    console.log("│  [r] 🔄 Regenerate — re-run this agent from scratch   │");
+    console.log("│  [q] ❌ Quit — stop the pipeline                      │");
+    console.log("└─────────────────────────────────────────────────────────┘");
+
+    const choice = await rl.question("\n❯ Your choice (a/c/r/q): ");
+    const action = choice.trim().toLowerCase();
+
+    if (action === "c") {
+      console.log("\n  Describe what you want to change. Examples:");
+      (hints[kind] ?? []).forEach((h) => console.log(h));
+      const feedback = await rl.question("\n❯ Describe changes: ");
+      return { action: "change", feedback: feedback.trim() };
+    }
+    if (action === "r") return { action: "regenerate" };
+    if (action === "q") return { action: "quit" };
+    return { action: "approve" };
+  } finally {
+    rl.close();
+  }
+}
+
+// ── Agent-specific change appliers ──────────────────────────────────────────
+
+async function applyAnalysisChange(ctx: SharedContext, feedback: string): Promise<void> {
+  log("INFO", `Refining analysis: "${feedback}"`);
+  const prompt = `[REFINE_ANALYSIS]
+The user reviewed the idea analysis and wants changes.
+
+Current analysis:
+${JSON.stringify(ctx.analysis, null, 2)}
+
+User request: "${feedback}"
+Original idea: "${ctx.idea}"
+
+Respond with the COMPLETE updated JSON (same schema as before):
+{
+  "projectName": "...",
+  "summary": "...",
+  "features": [{ "name": "...", "description": "...", "priority": "high|medium|low" }],
+  "techStack": { "frontend": [...], "backend": [...], "devtools": [...] }
+}
+
+Apply the user's requested changes while keeping all other fields intact.`;
+
+  const result = (await callLLM(prompt)) as FeatureAnalysis;
+  ctx.analysis = result;
+  log("INFO", `Analysis updated: ${result.features.length} features`);
+  await generateIdeaMd(ctx);
+}
+
+async function applySpecChange(ctx: SharedContext, feedback: string): Promise<void> {
+  log("INFO", `Refining spec: "${feedback}"`);
+  const prompt = `[REFINE_SPEC]
+The user reviewed the project spec and wants changes.
+
+Current spec:
+${JSON.stringify(ctx.spec, null, 2)}
+
+Analysis:
+${JSON.stringify(ctx.analysis, null, 2)}
+
+User request: "${feedback}"
+
+Respond with the COMPLETE updated JSON (same schema as before):
+{
+  "architecture": "...",
+  "fileStructure": [{ "filePath": "...", "description": "..." }],
+  "apiEndpoints": [],
+  "buildScript": "${PM} run build",
+  "testScript": "${PM} test"
+}
+
+Apply the user's requested changes while keeping all other fields intact.
+Remember: Next.js App Router with src/app/, src/components/, src/data/, src/types/ structure.`;
+
+  const result = (await callLLM(prompt)) as ProjectSpec;
+  ctx.spec = result;
+  log("INFO", `Spec updated: ${result.fileStructure.length} files planned`);
+  await generateSpecMd(ctx);
+}
+
+async function applyCodeChange(ctx: SharedContext, feedback: string): Promise<void> {
+  log("INFO", `Applying code change: "${feedback}"`);
+
+  const allFiles = await listFilesSafe(ctx.workspacePath);
+  const sourceFiles: { path: string; content: string }[] = [];
+
+  for (const fp of allFiles) {
+    if (fp.startsWith("node_modules") || fp.startsWith(".next") || fp.startsWith(".git")) continue;
+    if (fp.endsWith(".md")) continue;
+    if (/\.(ts|tsx|css|json|js|mjs|html)$/.test(fp)) {
+      const content = await readFileSafe(ctx.workspacePath, fp);
+      sourceFiles.push({ path: fp, content });
+    }
+  }
+
+  const prompt = `[APPLY_CHANGE]
+The user is reviewing their website and wants changes made.
+
+User request: "${feedback}"
+
+Project: ${ctx.analysis?.projectName}
+Idea: "${ctx.idea}"
+
+Current source files:
+${sourceFiles.map((f) => `--- ${f.path} ---\n${f.content}`).join("\n\n")}
+
+Respond with JSON:
+{
+  "fixes": [
+    { "filePath": "path/to/file", "content": "complete updated file content" }
+  ],
+  "explanation": "What was changed and why"
+}
+
+RULES:
+- Only include files that need to change — don't regenerate unchanged files
+- Return the COMPLETE file content (not a diff/patch)
+- Maintain all existing imports and exports
+- Keep the existing design system and color tokens
+- If the user asks about style changes, modify the relevant component's Tailwind classes or globals.css
+- If the user asks about content changes, modify the data files or component text
+- postcss.config.js must stay CommonJS
+- Do NOT break existing imports/exports`;
+
+  const fix = (await callLLM(prompt, 32000)) as BuildFixResponse;
+  log("INFO", `Applied changes: ${fix.explanation}`);
+
+  for (const f of fix.fixes) {
+    await writeFileSafe(ctx.workspacePath, f.filePath, f.content);
+    log("INFO", `  Updated: ${f.filePath}`);
+  }
+
+  console.log(`\n  ✅ Changes applied: ${fix.explanation}`);
+  console.log(`  📝 ${fix.fixes.length} file(s) updated`);
+  fix.fixes.forEach((f) => console.log(`     • ${f.filePath}`));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  ORCHESTRATOR
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1675,31 +2284,37 @@ async function orchestrate(idea: string): Promise<void> {
       name: "1 › Idea Analyzer",
       description: "Analyzes the idea, extracts features and tech stack",
       run: ideaAnalyzer,
+      kind: "analysis",
     },
     {
       name: "2 › Spec Builder",
       description: "Creates detailed project specification and file structure",
       run: specBuilder,
+      kind: "spec",
     },
     {
       name: "3 › Code Generator",
       description: "Generates complete source code for every file",
       run: codeGenerator,
+      kind: "codegen",
     },
     {
       name: "4 › Build & Auto-Fix",
       description: "Installs deps, builds project, auto-fixes errors (max 5 retries)",
       run: buildAndFixAgent,
+      kind: "build",
     },
     {
       name: "5 › Test Runner",
       description: "Runs the project test suite",
       run: testRunner,
+      kind: "test",
     },
     {
       name: "6 › Git Commit",
       description: "Initializes repo and creates initial commit",
       run: gitCommitAgent,
+      kind: "commit",
     },
   ];
 
@@ -1722,24 +2337,236 @@ async function orchestrate(idea: string): Promise<void> {
     log("INFO", `Starting: ${agent.name}`);
     log("INFO", agent.description);
 
-    const result = await agent.run(ctx);
+    let result = await agent.run(ctx);
 
     displayResult(agent.name, result);
 
     if (!result.success) {
       log("ERROR", `Pipeline stopped — ${agent.name} failed: ${result.error}`);
       ctx.errors.push(result.error ?? "Unknown error");
+      stopDevServer();
       process.exitCode = 1;
       return;
     }
 
-    const approved = await askApproval(`Approve "${agent.name}" and proceed to next step?`);
-    if (!approved) {
-      log("WARN", "Pipeline stopped by user");
-      return;
+    // ── Post-agent outputs ───────────────────────────────────────
+    if (agent.kind === "analysis" && ctx.analysis) {
+      await generateIdeaMd(ctx);
+    }
+    if (agent.kind === "spec" && ctx.spec) {
+      await generateSpecMd(ctx);
+    }
+
+    // ── Start dev server for live preview (after codegen or build) ───
+    const needsDevServer = agent.kind === "build" || agent.kind === "codegen";
+    if (needsDevServer) {
+      // Install deps if node_modules doesn't exist yet (codegen runs before build)
+      const nodeModulesExist = existsSync(path.join(ctx.workspacePath, "node_modules"));
+      if (!nodeModulesExist) {
+        log("INFO", `Installing dependencies with ${PM} for preview…`);
+        const installResult = execSafe(`${PM} install`, ctx.workspacePath);
+        if (!installResult.success) {
+          log("WARN", "Could not install deps for preview — server may not start");
+        }
+      }
+
+      // ── Runtime check: fetch pages, detect crashes, auto-fix ───
+      const RUNTIME_FIX_MAX = 3;
+      for (let rAttempt = 1; rAttempt <= RUNTIME_FIX_MAX; rAttempt++) {
+        log("INFO", `Runtime check (attempt ${rAttempt}/${RUNTIME_FIX_MAX})…`);
+        const rtResult = await runtimeCheck(ctx.workspacePath);
+
+        if (rtResult.success) {
+          log("INFO", "Runtime check passed ✓ — no errors detected");
+          break;
+        }
+
+        log("WARN", `Runtime check found ${rtResult.errors.length} error(s)`);
+        for (const e of rtResult.errors) {
+          log("WARN", `  • ${e.split("\n")[0]}`);
+        }
+
+        if (rAttempt === RUNTIME_FIX_MAX) {
+          log("WARN", "Max runtime fix attempts reached — continuing with known issues");
+          break;
+        }
+
+        // ── Auto-fix runtime errors via LLM ──────────────────────
+        log("INFO", "Sending runtime errors to LLM for auto-fix…");
+
+        // Collect broken files from error messages
+        const brokenFiles = new Set<string>();
+        for (const err of rtResult.errors) {
+          const fileMatches = err.matchAll(/(src\/[^\s:]+\.[a-z]+)/g);
+          for (const m of fileMatches) brokenFiles.add(m[1]);
+        }
+
+        // Always include data files (common source of runtime "undefined" errors)
+        try {
+          const dataDir = path.join(ctx.workspacePath, "src", "data");
+          const dataFiles = await fs.readdir(dataDir).catch(() => [] as string[]);
+          for (const f of dataFiles) {
+            if (f.endsWith(".ts") || f.endsWith(".tsx")) brokenFiles.add(`src/data/${f}`);
+          }
+        } catch { /* no data dir */ }
+
+        // Also include types
+        try {
+          const typesDir = path.join(ctx.workspacePath, "src", "types");
+          const typeFiles = await fs.readdir(typesDir).catch(() => [] as string[]);
+          for (const f of typeFiles) {
+            if (f.endsWith(".ts")) brokenFiles.add(`src/types/${f}`);
+          }
+        } catch { /* no types dir */ }
+
+        // Read file contents
+        const fileContents: string[] = [];
+        for (const relPath of brokenFiles) {
+          try {
+            const content = await fs.readFile(path.join(ctx.workspacePath, relPath), "utf-8");
+            fileContents.push(`=== ${relPath} ===\n${content}`);
+          } catch { /* skip unreadable */ }
+        }
+
+        const fixPrompt = `You are fixing RUNTIME errors in a Next.js 14 (App Router) + TypeScript project.
+
+RUNTIME ERRORS:
+${rtResult.errors.join("\n\n")}
+
+RELEVANT SERVER OUTPUT:
+${(rtResult.serverOutput ?? "").slice(-3000)}
+
+SOURCE FILES:
+${fileContents.join("\n\n")}
+
+COMMON RUNTIME ERROR PATTERNS:
+- "Cannot read properties of undefined (reading 'map')" → data is undefined, add fallback: (data ?? []).map(...)
+- "Cannot read properties of undefined (reading '0')" → array access on undefined, add optional chaining: arr?.[0]
+- Import exists but export doesn't → add the missing export to the data/types file
+- Component uses properties that don't exist on the data type → fix property names to match actual data
+
+Return a JSON object with:
+{
+  "explanation": "what you fixed and why",
+  "files": [
+    { "path": "src/components/Categories.tsx", "content": "...full corrected file content..." }
+  ]
+}
+
+RULES:
+- Fix ALL runtime errors, not just the first one
+- Add defensive checks: optional chaining (?.), nullish coalescing (??), default empty arrays
+- Ensure every import references an actually exported symbol
+- Return COMPLETE file contents, not patches`;
+
+        try {
+          const rtFix = (await callLLM(fixPrompt)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
+          if (rtFix.files && Array.isArray(rtFix.files)) {
+            for (const f of rtFix.files) {
+              const filePath = path.join(ctx.workspacePath, f.path);
+              await fs.mkdir(path.dirname(filePath), { recursive: true });
+              await fs.writeFile(filePath, f.content, "utf-8");
+              log("INFO", `  Fixed: ${f.path}`);
+            }
+            log("INFO", `Runtime fix applied: ${rtFix.explanation ?? "see files"}`);
+          }
+        } catch (fixErr: unknown) {
+          const msg = fixErr instanceof Error ? fixErr.message : String(fixErr);
+          log("ERROR", `LLM runtime fix failed: ${msg}`);
+          break;
+        }
+
+        // Wait before next runtime check
+        await sleep(3000);
+      }
+
+      // Start the preview dev server for user review
+      startDevServer(ctx.workspacePath);
+      await sleep(5000); // Give Next.js dev server time to compile
+    }
+
+    // ── Interactive review loop (all agents) ─────────────────────
+    let reviewing = true;
+    while (reviewing) {
+      const choice = await askAgentReview(agent.kind);
+
+      switch (choice.action) {
+        case "approve":
+          reviewing = false;
+          if (needsDevServer) stopDevServer();
+          break;
+
+        case "change":
+          if (choice.feedback) {
+            // Apply change based on agent kind
+            switch (agent.kind) {
+              case "analysis":
+                await applyAnalysisChange(ctx, choice.feedback);
+                break;
+              case "spec":
+                await applySpecChange(ctx, choice.feedback);
+                break;
+              case "codegen":
+              case "build":
+              case "test":
+                await applyCodeChange(ctx, choice.feedback);
+                // Rebuild if we have source files
+                if (agent.kind === "build" || agent.kind === "codegen") {
+                  log("INFO", "Rebuilding after changes…");
+                  const rebuild = execSafe(`${PM} run build`, ctx.workspacePath);
+                  if (rebuild.success) {
+                    console.log("\n  ✅ Rebuild successful — refresh browser to see changes");
+                  } else {
+                    console.log("\n  ⚠️  Rebuild failed — running auto-fix…");
+                    const fixResult = await buildAndFixAgent(ctx);
+                    if (fixResult.success) {
+                      console.log("  ✅ Auto-fix successful — refresh browser");
+                    } else {
+                      console.log("  ❌ Auto-fix failed. Try another change or approve as-is.");
+                    }
+                  }
+                }
+                break;
+              case "commit":
+                // For commit, just re-run with new message preference stored in feedback
+                ctx.errors.push(`commit_msg_hint:${choice.feedback}`);
+                break;
+            }
+          }
+          break;
+
+        case "regenerate":
+          log("INFO", `Re-running ${agent.name} from scratch…`);
+          if (needsDevServer) stopDevServer();
+          result = await agent.run(ctx);
+          displayResult(agent.name, result);
+
+          if (!result.success) {
+            log("ERROR", `Pipeline stopped — ${agent.name} failed on regenerate: ${result.error}`);
+            stopDevServer();
+            process.exitCode = 1;
+            return;
+          }
+
+          // Re-generate docs if applicable
+          if (agent.kind === "analysis" && ctx.analysis) await generateIdeaMd(ctx);
+          if (agent.kind === "spec" && ctx.spec) await generateSpecMd(ctx);
+          if (needsDevServer) {
+            startDevServer(ctx.workspacePath);
+            await sleep(4000);
+          }
+          break;
+
+        case "quit":
+          reviewing = false;
+          stopDevServer();
+          log("WARN", "Pipeline stopped by user during review");
+          return;
+      }
     }
   }
 
+  stopDevServer();
   console.log(`\n${"═".repeat(60)}`);
   console.log("  Pipeline completed successfully!");
   console.log(`  Project: ${projectDir}`);
