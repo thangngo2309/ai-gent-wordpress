@@ -99,6 +99,21 @@ interface SharedContext {
   errors: string[];
 }
 
+interface Checkpoint {
+  version: number;
+  idea: string;
+  completedAgents: number[];  // indices of completed agents (0-based)
+  lastAgentIndex: number;      // index of last completed agent
+  timestamp: string;
+  analysis: FeatureAnalysis | null;
+  spec: ProjectSpec | null;
+  generatedFiles: GeneratedFile[];
+  buildLogs: string[];
+  testLogs: string[];
+}
+
+const CHECKPOINT_FILE = ".agent-checkpoint.json";
+
 type ReviewAction = "approve" | "change" | "regenerate" | "quit";
 
 interface ReviewChoice {
@@ -2258,6 +2273,57 @@ RULES:
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  CHECKPOINT — save/load progress for resume
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function saveCheckpoint(ctx: SharedContext, agentIndex: number, completedAgents: number[]): Promise<void> {
+  const checkpoint: Checkpoint = {
+    version: 1,
+    idea: ctx.idea,
+    completedAgents,
+    lastAgentIndex: agentIndex,
+    timestamp: new Date().toISOString(),
+    analysis: ctx.analysis,
+    spec: ctx.spec,
+    generatedFiles: ctx.generatedFiles,
+    buildLogs: ctx.buildLogs,
+    testLogs: ctx.testLogs,
+  };
+  const cpPath = path.join(ctx.workspacePath, CHECKPOINT_FILE);
+  await fs.mkdir(ctx.workspacePath, { recursive: true });
+  await fs.writeFile(cpPath, JSON.stringify(checkpoint, null, 2), "utf-8");
+  log("DEBUG", `Checkpoint saved at agent ${agentIndex} → ${cpPath}`);
+}
+
+async function loadCheckpoint(projectPath: string): Promise<Checkpoint | null> {
+  const cpPath = path.join(projectPath, CHECKPOINT_FILE);
+  try {
+    const raw = await fs.readFile(cpPath, "utf-8");
+    const cp = JSON.parse(raw) as Checkpoint;
+    if (!cp.version || !cp.idea || !Array.isArray(cp.completedAgents)) {
+      log("WARN", "Invalid checkpoint file — starting fresh");
+      return null;
+    }
+    return cp;
+  } catch {
+    return null;
+  }
+}
+
+function restoreContext(cp: Checkpoint, projectPath: string): SharedContext {
+  return {
+    idea: cp.idea,
+    workspacePath: projectPath,
+    analysis: cp.analysis,
+    spec: cp.spec,
+    generatedFiles: cp.generatedFiles,
+    buildLogs: cp.buildLogs,
+    testLogs: cp.testLogs,
+    errors: [],
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 //  ORCHESTRATOR
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -2274,10 +2340,46 @@ function createContext(idea: string, outputDir: string): SharedContext {
   };
 }
 
-async function orchestrate(idea: string): Promise<void> {
-  const outputRoot = path.resolve(process.env.OUTPUT_DIR ?? "./output");
-  const projectDir = path.join(outputRoot, `project-${Date.now()}`);
-  const ctx = createContext(idea, projectDir);
+async function orchestrate(idea: string, resumePath?: string): Promise<void> {
+  let ctx: SharedContext;
+  let projectDir: string;
+  let startIndex = 0;
+  const completedAgents: number[] = [];
+
+  if (resumePath) {
+    // ── RESUME MODE ──────────────────────────────────────────────
+    projectDir = path.resolve(resumePath);
+    const checkpoint = await loadCheckpoint(projectDir);
+
+    if (!checkpoint) {
+      log("ERROR", `No valid checkpoint found in ${projectDir}`);
+      log("INFO", "Make sure the path contains a .agent-checkpoint.json file");
+      process.exitCode = 1;
+      return;
+    }
+
+    ctx = restoreContext(checkpoint, projectDir);
+    completedAgents.push(...checkpoint.completedAgents);
+
+    // If all 6 agents completed → restart from agent 1
+    if (checkpoint.completedAgents.length >= 6) {
+      log("INFO", "All agents were completed. Restarting pipeline from Agent 1…");
+      startIndex = 0;
+      completedAgents.length = 0; // reset
+    } else {
+      startIndex = checkpoint.lastAgentIndex + 1;
+    }
+
+    log("INFO", `Resuming project from checkpoint`);
+    log("INFO", `  Original idea: ${checkpoint.idea}`);
+    log("INFO", `  Completed agents: ${checkpoint.completedAgents.map(i => i + 1).join(", ") || "none"}`);
+    log("INFO", `  Resuming from agent ${startIndex + 1}`);
+  } else {
+    // ── NEW PROJECT MODE ─────────────────────────────────────────
+    const outputRoot = path.resolve(process.env.OUTPUT_DIR ?? "./output");
+    projectDir = path.join(outputRoot, `project-${Date.now()}`);
+    ctx = createContext(idea, projectDir);
+  }
 
   const agents: AgentStep[] = [
     {
@@ -2324,15 +2426,29 @@ async function orchestrate(idea: string): Promise<void> {
     "║           AI CODING AGENT ORCHESTRATOR                     ║",
     "╚══════════════════════════════════════════════════════════════╝",
     "",
-    `  Idea    : ${idea}`,
+    `  Idea    : ${ctx.idea}`,
     `  Output  : ${projectDir}`,
     `  LLM     : ${USE_MOCK ? "MOCK (no API key)" : process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514"}`,
     `  Agents  : ${agents.length}`,
+    ...(resumePath
+      ? [
+          `  Mode    : 🔄 RESUME from agent ${startIndex + 1}`,
+          `  Done    : ${completedAgents.map(i => i + 1).join(", ") || "none"}`,
+        ]
+      : [`  Mode    : 🆕 New project`]),
     "",
   ];
   console.log(banner.join("\n"));
 
-  for (const agent of agents) {
+  for (let agentIdx = startIndex; agentIdx < agents.length; agentIdx++) {
+    const agent = agents[agentIdx];
+
+    // Skip already-completed agents
+    if (completedAgents.includes(agentIdx)) {
+      log("INFO", `Skipping ${agent.name} (already completed)`);
+      continue;
+    }
+
     console.log(`\n${"═".repeat(60)}`);
     log("INFO", `Starting: ${agent.name}`);
     log("INFO", agent.description);
@@ -2344,6 +2460,9 @@ async function orchestrate(idea: string): Promise<void> {
     if (!result.success) {
       log("ERROR", `Pipeline stopped — ${agent.name} failed: ${result.error}`);
       ctx.errors.push(result.error ?? "Unknown error");
+      // Save checkpoint so user can resume after fixing
+      await saveCheckpoint(ctx, agentIdx > 0 ? agentIdx - 1 : -1, completedAgents);
+      log("INFO", `Checkpoint saved — resume later with: node agent.js --resume ${projectDir}`);
       stopDevServer();
       process.exitCode = 1;
       return;
@@ -2494,6 +2613,10 @@ RULES:
         case "approve":
           reviewing = false;
           if (needsDevServer) stopDevServer();
+          // Save checkpoint after approval
+          completedAgents.push(agentIdx);
+          await saveCheckpoint(ctx, agentIdx, completedAgents);
+          log("INFO", `Checkpoint saved — agent ${agentIdx + 1} completed`);
           break;
 
         case "change":
@@ -2560,6 +2683,9 @@ RULES:
         case "quit":
           reviewing = false;
           stopDevServer();
+          // Save checkpoint so user can resume later
+          await saveCheckpoint(ctx, agentIdx > 0 ? agentIdx - 1 : -1, completedAgents);
+          log("INFO", `Checkpoint saved — resume later with: node agent.js --resume ${projectDir}`);
           log("WARN", "Pipeline stopped by user during review");
           return;
       }
@@ -2567,9 +2693,12 @@ RULES:
   }
 
   stopDevServer();
+  // Save final checkpoint
+  await saveCheckpoint(ctx, agents.length - 1, completedAgents);
   console.log(`\n${"═".repeat(60)}`);
-  console.log("  Pipeline completed successfully!");
-  console.log(`  Project: ${projectDir}`);
+  console.log("  ✅ Pipeline completed successfully!");
+  console.log(`  📁 Project: ${projectDir}`);
+  console.log(`  🔄 Resume:  node agent.js --resume ${projectDir}`);
   console.log(`${"═".repeat(60)}\n`);
 }
 
@@ -2583,12 +2712,14 @@ async function main(): Promise<void> {
   if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     console.log(`
 Usage:
-  node agent.js "<your idea>"
-  npx ts-node agent.ts "<your idea>"
+  node agent.js "<your idea>"                    # New project
+  node agent.js --resume <project-path>          # Resume existing project
+  node agent.js --resume ./output/project-xxx    # Resume from checkpoint
 
 Examples:
   node agent.js "build a landing page for selling bikes"
   node agent.js "create a todo app with authentication"
+  node agent.js --resume ./output/project-1775238748739
 
 Environment:
   ANTHROPIC_API_KEY   Claude API key (omit for mock/demo mode)
@@ -2600,6 +2731,43 @@ Environment:
     return;
   }
 
+  // ── Resume mode ────────────────────────────────────────────────
+  const resumeIdx = args.indexOf("--resume");
+  if (resumeIdx !== -1) {
+    const projectPath = args[resumeIdx + 1];
+    if (!projectPath) {
+      console.error("Error: --resume requires a project path");
+      console.error("Example: node agent.js --resume ./output/project-1775238748739");
+      process.exitCode = 1;
+      return;
+    }
+    const absPath = path.resolve(projectPath);
+    if (!existsSync(absPath)) {
+      console.error(`Error: Project path does not exist: ${absPath}`);
+      process.exitCode = 1;
+      return;
+    }
+    await orchestrate("", absPath);
+    return;
+  }
+
+  // ── Auto-detect: if arg looks like a path to an existing project, resume it ──
+  const firstArg = args[0];
+  if (
+    firstArg &&
+    (firstArg.startsWith("./") || firstArg.startsWith("/") || firstArg.startsWith("output/")) &&
+    existsSync(path.resolve(firstArg))
+  ) {
+    const absPath = path.resolve(firstArg);
+    const hasCheckpoint = existsSync(path.join(absPath, CHECKPOINT_FILE));
+    if (hasCheckpoint) {
+      log("INFO", `Detected existing project with checkpoint — resuming`);
+      await orchestrate("", absPath);
+      return;
+    }
+  }
+
+  // ── New project mode ──────────────────────────────────────────
   const idea = args.join(" ");
   await orchestrate(idea);
 }
