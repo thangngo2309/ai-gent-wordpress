@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Customer Service Platform Plan</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html {
+      scroll-behavior: smooth;
+    }
+  </style>
+</head>
+<body class="bg-gray-100 text-gray-800">
+  <div class="min-h-screen">
+
+    <header class="bg-gradient-to-r from-indigo-700 via-purple-700 to-blue-700 text-white py-20 px-6 shadow-2xl">
+      <div class="max-w-7xl mx-auto">
+        <h1 class="text-5xl font-bold leading-tight mb-6">
+          Kế hoạch triển khai hệ thống
+          <br />
+          Chăm sóc khách hàng sử dụng AI
+        </h1>
+
+        <p class="text-xl text-indigo-100 max-w-4xl leading-relaxed">
+          Nền tảng CSKH thông minh giúp tự động hóa vận hành, giảm tải nhân sự,
+          xử lý vận đơn, thanh toán, kích hoạt tài khoản và hoàn tiền bằng AI.
+        </p>
+      </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-6 py-10 space-y-10">
+
+      <section class="bg-white rounded-3xl p-8 shadow-lg">
+        <h2 class="text-3xl font-bold mb-6">🎯 Mục tiêu hệ thống</h2>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
+          <div class="bg-indigo-50 rounded-2xl p-5 border border-indigo-100">
+            <h3 class="font-bold text-lg mb-3">Tự động hóa</h3>
+            <p>Giảm thao tác thủ công của nhân viên CSKH.</p>
+          </div>
+
+          <div class="bg-green-50 rounded-2xl p-5 border border-green-100">
+            <h3 class="font-bold text-lg mb-3">Hỗ trợ 24/7</h3>
+            <p>AI chatbot hoạt động liên tục mọi thời điểm.</p>
+          </div>
+
+          <div class="bg-orange-50 rounded-2xl p-5 border border-orange-100">
+            <h3 class="font-bold text-lg mb-3">Tăng tốc xử lý</h3>
+            <p>Rút ngắn thời gian phản hồi khách hàng.</p>
+          </div>
+
+          <div class="bg-purple-50 rounded-2xl p-5 border border-purple-100">
+            <h3 class="font-bold text-lg mb-3">Giảm sai sót</h3>
+            <p>Đồng bộ dữ liệu và kiểm tra tự động.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="bg-white rounded-3xl p-8 shadow-lg">
+        <h2 class="text-3xl font-bold mb-6">🏗️ Kiến trúc tổng thể AI Platform</h2>
+
+        <div class="bg-gray-900 text-green-400 rounded-2xl p-6 overflow-x-auto text-sm leading-8 font-mono">
+<pre>
+Khách hàng
+    ↓
+Website / App / Zalo / Facebook
+    ↓
+AI Chatbot Gateway
+    ↓
+------------------------------------------------
+| AI Assistant Layer                           |
+| - NLP / LLM                                 |
+| - Intent Detection                          |
+| - AI Workflow Engine                        |
+------------------------------------------------
+    ↓
+------------------------------------------------
+| Business Services                           |
+| - Shipping Service                          |
+| - Payment Verification Service              |
+| - Account Activation Service                |
+| - Refund Service                            |
+------------------------------------------------
+    ↓
+------------------------------------------------
+| External APIs                               |
+| - Shipping API                              |
+| - Bank API                                  |
+| - Payment Gateway                           |
+| - SMS / Email API                           |
+------------------------------------------------
+</pre>
+        </div>
+      </section>
+
+      <section class="space-y-8">
+
+        <div class="bg-white rounded-3xl p-8 shadow-lg">
+          <h2 class="text-3xl font-bold mb-6">📦 Module 1 — AI Tra cứu vận đơn</h2>
+
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">Mô tả chức năng</h3>
+
+              <p class="text-gray-700 leading-relaxed mb-6">
+                Khách hàng có thể chat tự nhiên với AI để kiểm tra trạng thái đơn hàng,
+                thời gian giao dự kiến và lịch sử vận chuyển.
+              </p>
+
+              <div class="space-y-3">
+                <div class="bg-gray-50 rounded-xl p-4 border">
+                  “Đơn hàng của tôi đang ở đâu?”
+                </div>
+
+                <div class="bg-gray-50 rounded-xl p-4 border">
+                  “Kiểm tra giúp mã ABC123”
+                </div>
+
+                <div class="bg-gray-50 rounded-xl p-4 border">
+                  “Bao giờ đơn tới?”
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">AI Workflow</h3>
+
+              <div class="bg-indigo-50 rounded-2xl p-6 border border-indigo-100">
+                <ol class="space-y-4 list-decimal list-inside">
+                  <li>AI nhận tin nhắn khách hàng</li>
+                  <li>AI xác định intent</li>
+                  <li>Extract mã vận đơn</li>
+                  <li>Call Shipping API</li>
+                  <li>AI format kết quả</li>
+                  <li>Trả phản hồi tự nhiên</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-3xl p-8 shadow-lg">
+          <h2 class="text-3xl font-bold mb-6">💳 Module 2 — AI Kiểm tra chuyển khoản</h2>
+
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">AI xử lý thanh toán</h3>
+
+              <ul class="space-y-3 list-disc list-inside text-gray-700">
+                <li>Tự kiểm tra giao dịch ngân hàng</li>
+                <li>Đối soát số tiền và nội dung</li>
+                <li>Phát hiện giao dịch lỗi</li>
+                <li>Tự động xác nhận thanh toán</li>
+                <li>Kích hoạt account sau khi thanh toán thành công</li>
+              </ul>
+            </div>
+
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">AI có thể xử lý</h3>
+
+              <div class="space-y-4">
+                <div class="bg-yellow-50 border border-yellow-100 rounded-2xl p-5">
+                  Chuyển khoản sai nội dung
+                </div>
+
+                <div class="bg-red-50 border border-red-100 rounded-2xl p-5">
+                  Chuyển thiếu tiền
+                </div>
+
+                <div class="bg-green-50 border border-green-100 rounded-2xl p-5">
+                  Chuyển dư tiền
+                </div>
+
+                <div class="bg-purple-50 border border-purple-100 rounded-2xl p-5">
+                  Giao dịch trùng lặp
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-3xl p-8 shadow-lg">
+          <h2 class="text-3xl font-bold mb-6">🔓 Module 3 — AI Kích hoạt tài khoản</h2>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">Workflow</h3>
+
+              <div class="bg-gray-900 text-green-400 rounded-2xl p-6 font-mono text-sm leading-8 overflow-x-auto">
+<pre>
+Payment Success
+    ↓
+AI kiểm tra gói dịch vụ
+    ↓
+Tạo tài khoản
+    ↓
+Set expiration
+    ↓
+Send Email/SMS
+    ↓
+Done
+</pre>
+              </div>
+            </div>
+
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">AI Fraud Detection</h3>
+
+              <ul class="space-y-3 list-disc list-inside text-gray-700">
+                <li>Phát hiện spam đăng ký</li>
+                <li>Kiểm tra nhiều account cùng IP</li>
+                <li>Detect bot payment</li>
+                <li>Phân tích hành vi bất thường</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-3xl p-8 shadow-lg">
+          <h2 class="text-3xl font-bold mb-6">💸 Module 4 — AI Refund System</h2>
+
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">Refund AI</h3>
+
+              <ul class="space-y-3 list-disc list-inside text-gray-700">
+                <li>Phân tích nguyên nhân refund</li>
+                <li>Chấm điểm mức độ rủi ro</li>
+                <li>Tự đề xuất approve/reject</li>
+                <li>Detect refund abuse</li>
+                <li>Giảm tải nhân viên CSKH</li>
+              </ul>
+            </div>
+
+            <div>
+              <h3 class="text-2xl font-semibold mb-4">Refund Workflow</h3>
+
+              <div class="bg-indigo-50 rounded-2xl p-6 border border-indigo-100">
+                <ol class="space-y-4 list-decimal list-inside">
+                  <li>Khách yêu cầu refund</li>
+                  <li>AI phân tích ticket</li>
+                  <li>Check lịch sử giao dịch</li>
+                  <li>Check shipping status</li>
+                  <li>AI đề xuất xử lý</li>
+                  <li>Approve / Manual Review / Reject</li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-3xl p-8 shadow-lg">
+          <h2 class="text-3xl font-bold mb-6">🤖 Module 5 — AI Chatbot đa nền tảng</h2>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-5 mb-8">
+            <div class="bg-blue-50 rounded-2xl p-5 text-center border border-blue-100">
+              Website
+            </div>
+
+            <div class="bg-green-50 rounded-2xl p-5 text-center border border-green-100">
+              Mobile App
+            </div>
+
+            <div class="bg-purple-50 rounded-2xl p-5 text-center border border-purple-100">
+              Facebook
+            </div>
+
+            <div class="bg-orange-50 rounded-2xl p-5 text-center border border-orange-100">
+              Zalo OA
+            </div>
+
+            <div class="bg-pink-50 rounded-2xl p-5 text-center border border-pink-100">
+              Telegram
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
+            <div class="bg-gray-50 rounded-2xl p-5 border">
+              Context Memory
+            </div>
+
+            <div class="bg-gray-50 rounded-2xl p-5 border">
+              Multi-language Support
+            </div>
+
+            <div class="bg-gray-50 rounded-2xl p-5 border">
+              Voice AI Support
+            </div>
+
+            <div class="bg-gray-50 rounded-2xl p-5 border">
+              Smart Escalation
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-3xl p-8 shadow-lg">
+          <h2 class="text-3xl font-bold mb-6">📊 Module 6 — AI Dashboard Analytics</h2>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
+            <div class="bg-indigo-50 rounded-2xl p-5 border border-indigo-100">
+              Ticket Realtime
+            </div>
+
+            <div class="bg-green-50 rounded-2xl p-5 border border-green-100">
+              Payment Pending
+            </div>
+
+            <div class="bg-red-50 rounded-2xl p-5 border border-red-100">
+              Refund Monitoring
+            </div>
+
+            <div class="bg-yellow-50 rounded-2xl p-5 border border-yellow-100">
+              Fraud Analytics
+            </div>
+          </div>
+        </div>
+
+      </section>
+
+      <section class="bg-white rounded-3xl p-8 shadow-lg">
+        <h2 class="text-3xl font-bold mb-8">🧠 AI Technology Stack</h2>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          <div>
+            <h3 class="text-2xl font-semibold mb-4">AI Layer</h3>
+
+            <table class="w-full border-collapse overflow-hidden rounded-2xl">
+              <thead>
+                <tr class="bg-gray-900 text-white text-left">
+                  <th class="p-4">Thành phần</th>
+                  <th class="p-4">Công nghệ</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                <tr class="border-b bg-white">
+                  <td class="p-4">LLM</td>
+                  <td class="p-4">OpenAI GPT / Claude</td>
+                </tr>
+
+                <tr class="border-b bg-gray-50">
+                  <td class="p-4">AI Agent</td>
+                  <td class="p-4">LangGraph / CrewAI</td>
+                </tr>
+
+                <tr class="border-b bg-white">
+                  <td class="p-4">RAG</td>
+                  <td class="p-4">Qdrant / Pinecone</td>
+                </tr>
+
+                <tr class="bg-gray-50">
+                  <td class="p-4">Workflow</td>
+                  <td class="p-4">Temporal</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <h3 class="text-2xl font-semibold mb-4">Backend & Infrastructure</h3>
+
+            <table class="w-full border-collapse overflow-hidden rounded-2xl">
+              <thead>
+                <tr class="bg-gray-900 text-white text-left">
+                  <th class="p-4">Thành phần</th>
+                  <th class="p-4">Công nghệ</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                <tr class="border-b bg-white">
+                  <td class="p-4">Backend</td>
+                  <td class="p-4">FastAPI</td>
+                </tr>
+
+                <tr class="border-b bg-gray-50">
+                  <td class="p-4">Database</td>
+                  <td class="p-4">PostgreSQL</td>
+                </tr>
+
+                <tr class="border-b bg-white">
+                  <td class="p-4">Queue</td>
+                  <td class="p-4">RabbitMQ</td>
+                </tr>
+
+                <tr class="bg-gray-50">
+                  <td class="p-4">Cache</td>
+                  <td class="p-4">Redis</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="bg-gradient-to-r from-indigo-700 to-purple-700 text-white rounded-3xl p-10 shadow-2xl">
+        <h2 class="text-4xl font-bold mb-8">🚀 Lộ trình triển khai</h2>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+
+          <div class="bg-white/10 backdrop-blur-sm rounded-2xl p-6 border border-white/10">
+            <h3 class="text-2xl font-bold mb-4">Phase 1 — MVP</h3>
+
+            <ul class="space-y-3 list-disc list-inside text-indigo-100">
+              <li>AI Chatbot cơ bản</li>
+              <li>Tra cứu vận đơn</li>
+              <li>Check payment</li>
+              <li>Dashboard cơ bản</li>
+            </ul>
+          </div>
+
+          <div class="bg-white/10 backdrop-blur-sm rounded-2xl p-6 border border-white/10">
+            <h3 class="text-2xl font-bold mb-4">Phase 2 — Automation</h3>
+
+            <ul class="space-y-3 list-disc list-inside text-indigo-100">
+              <li>Auto activation</li>
+              <li>Auto refund workflow</li>
+              <li>Notification AI</li>
+              <li>AI ticket routing</li>
+            </ul>
+          </div>
+
+          <div class="bg-white/10 backdrop-blur-sm rounded-2xl p-6 border border-white/10">
+            <h3 class="text-2xl font-bold mb-4">Phase 3 — AI Intelligence</h3>
+
+            <ul class="space-y-3 list-disc list-inside text-indigo-100">
+              <li>Fraud detection</li>
+              <li>Sentiment analysis</li>
+              <li>AI analytics</li>
+              <li>Voice AI</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="bg-white rounded-3xl p-8 shadow-lg">
+        <h2 class="text-3xl font-bold mb-8">💰 Ước lượng chi phí</h2>
+
+        <div class="overflow-x-auto">
+          <table class="w-full border-collapse overflow-hidden rounded-2xl">
+            <thead>
+              <tr class="bg-gray-900 text-white text-left">
+                <th class="p-5">Giai đoạn</th>
+                <th class="p-5">Estimate</th>
+                <th class="p-5">Mô tả</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              <tr class="border-b bg-white">
+                <td class="p-5">MVP</td>
+                <td class="p-5">80–150 triệu</td>
+                <td class="p-5">Core AI + chatbot + payment + shipping</td>
+              </tr>
+
+              <tr class="border-b bg-gray-50">
+                <td class="p-5">Automation</td>
+                <td class="p-5">200–400 triệu</td>
+                <td class="p-5">Workflow AI + refund + analytics</td>
+              </tr>
+
+              <tr class="bg-white">
+                <td class="p-5">Advanced AI Platform</td>
+                <td class="p-5">500 triệu+</td>
+                <td class="p-5">AI Agent ecosystem + voice AI + fraud AI</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="bg-gray-900 text-white rounded-3xl p-10 shadow-2xl text-center">
+        <h2 class="text-4xl font-bold mb-6">✨ Giá trị mang lại</h2>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8 text-left mt-8">
+          <div class="bg-white/5 rounded-2xl p-6 border border-white/10">
+            <h3 class="text-2xl font-bold mb-4">Cho doanh nghiệp</h3>
+
+            <ul class="space-y-3 text-gray-300 list-disc list-inside">
+              <li>Giảm 50–80% tải CSKH</li>
+              <li>Tự động hóa vận hành</li>
+              <li>Giảm lỗi xử lý thủ công</li>
+              <li>Tăng tốc phản hồi khách hàng</li>
+              <li>Giảm fraud & abuse</li>
+            </ul>
+          </div>
+
+          <div class="bg-white/5 rounded-2xl p-6 border border-white/10">
+            <h3 class="text-2xl font-bold mb-4">Cho khách hàng</h3>
+
+            <ul class="space-y-3 text-gray-300 list-disc list-inside">
+              <li>Hỗ trợ nhanh 24/7</li>
+              <li>Không cần chờ nhân viên</li>
+              <li>Tra cứu realtime</li>
+              <li>Thanh toán & kích hoạt nhanh</li>
+              <li>Trải nghiệm hiện đại hơn</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</body>
+</html>
