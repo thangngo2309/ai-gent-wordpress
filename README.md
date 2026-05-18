@@ -1,6 +1,6 @@
 # AI Coding Agent Orchestrator
 
-Multi-agent pipeline tự động sinh website hoàn chỉnh từ một câu mô tả idea. Sử dụng Claude API (Anthropic) để phân tích, thiết kế, generate code, build, test và commit. Hỗ trợ **checkpoint/resume** — dừng giữa chừng và tiếp tục bất cứ lúc nào.
+Multi-agent pipeline tự động sinh **WordPress theme** hoàn chỉnh từ một câu mô tả idea. Sử dụng Claude API (Anthropic) để phân tích, thiết kế, generate code, validate, test và commit. Hỗ trợ **checkpoint/resume** — dừng giữa chừng và tiếp tục bất cứ lúc nào.
 
 ## Architecture
 
@@ -24,9 +24,9 @@ Multi-agent pipeline tự động sinh website hoàn chỉnh từ một câu mô
                     ✅ approve → checkpoint saved
                            │
               ┌────────────▼────────────────────┐
-              │   Agent 3: Code Generator       │  → src/**
+              │   Agent 3: Code Generator       │  → theme files
               │   Batched (4 files/call)        │
-              │   + npm install                 │
+              │   + PHP lint validation         │
               │   + Runtime check & auto-fix    │
               │   + Dev server (localhost:3456) │
               └────────────┬────────────────────┘
@@ -34,7 +34,7 @@ Multi-agent pipeline tự động sinh website hoàn chỉnh từ một câu mô
                     ✅ approve → checkpoint saved
                            │
               ┌────────────▼────────────────────┐
-              │   Agent 4: Build & Auto-Fix     │  → production build
+              │   Agent 4: Build & Auto-Fix     │  → PHP lint all files
               │   Loop max 5 retries            │
               │   + Runtime check (3x auto-fix) │
               │   + Dev server (localhost:3456) │
@@ -91,8 +91,8 @@ Checkpoint lưu đầy đủ: idea, analysis, spec, generated files, build logs,
 |-----------|------------|
 | Language | TypeScript (Node.js ≥ 18) |
 | LLM | Claude Sonnet via Anthropic API |
-| Generated apps | Next.js 14 + Tailwind CSS + TypeScript |
-| Package manager | npm (auto-fallback từ pnpm) |
+| Generated output | WordPress Theme (PHP + CSS + Vanilla JS) |
+| Validation | `php -l` (PHP lint) |
 | Config | dotenv (`.env`) |
 
 ## Project Structure
@@ -112,33 +112,31 @@ ai-agent-for-develop/
         ├── .agent-checkpoint.json  # ← Checkpoint (auto-saved)
         ├── IDEA.md                 # Feature analysis output
         ├── SPEC.md                 # Architecture spec output
-        ├── package.json
-        ├── next.config.mjs
-        ├── tailwind.config.ts
-        ├── postcss.config.js
-        ├── tsconfig.json
-        └── src/
-            ├── app/
-            │   ├── layout.tsx
-            │   ├── page.tsx
-            │   └── globals.css
-            ├── components/
-            │   ├── Header.tsx
-            │   ├── Hero.tsx
-            │   ├── FeaturedProducts.tsx
-            │   ├── Categories.tsx
-            │   ├── Editorial.tsx
-            │   ├── Archives.tsx
-            │   ├── About.tsx
-            │   ├── Footer.tsx
-            │   └── BackToTop.tsx
-            ├── data/
-            │   ├── site.ts
-            │   ├── products.ts
-            │   ├── articles.ts
-            │   └── archives.ts
-            └── types/
-                └── index.ts
+        ├── style.css                 # Theme metadata + styles
+        ├── functions.php             # Theme setup, enqueue
+        ├── header.php                # Header template
+        ├── footer.php                # Footer template
+        ├── index.php                 # Main template
+        ├── front-page.php            # Front page template
+        ├── page.php                  # Page template
+        ├── single.php                # Single post template
+        ├── 404.php                   # 404 template
+        ├── inc/
+        │   ├── customizer.php        # Customizer settings
+        │   └── theme-data.php        # Static data arrays
+        ├── template-parts/
+        │   ├── hero.php
+        │   ├── featured-products.php
+        │   ├── categories.php
+        │   ├── editorial.php
+        │   ├── archives-gallery.php
+        │   ├── about.php
+        │   └── back-to-top.php
+        └── assets/
+            ├── css/
+            │   └── animations.css
+            └── js/
+                └── main.js
 ```
 
 ## Cài đặt
@@ -235,7 +233,7 @@ node dist/agent.js --resume ./output/project-xxx
 ### Agent 2: Spec Builder
 - Input: Feature analysis từ Agent 1
 - Output: `SPEC.md` — file tree, component diagram, architecture overview
-- LLM prompt: Thiết kế Next.js App Router structure với Tailwind CSS
+- LLM prompt: Thiết kế WordPress theme structure với vanilla CSS + BEM
 - **Review**: Xem SPEC.md trên console → approve / change / regenerate
 - Ví dụ change: `"add a FAQ component"`, `"add testimonials data file"`, `"remove contact form"`
 
@@ -243,25 +241,25 @@ node dist/agent.js --resume ./output/project-xxx
 - Input: Spec từ Agent 2
 - Output: Toàn bộ source code ghi vào disk
 - Batched: 4 files/LLM call (tránh token overflow)
-- Smart ordering: types → data → config → components → pages → tests
-- Post-gen: auto `npm install` → **runtime check** (fetch pages, bắt 500/TypeError, auto-fix max 3x) → start dev server
-- **Review**: Mở `http://localhost:3456` xem website → approve / change / regenerate
+- Smart ordering: style.css → functions.php → inc/ → header/footer → page templates → template-parts → assets
+- Post-gen: **PHP lint** → **runtime check** (PHP built-in server, bắt Fatal/Parse error, auto-fix max 3x) → start dev server
+- **Review**: Mở `http://localhost:3456` xem theme → approve / change / regenerate
 - Ví dụ change: `"change hero background to dark blue"`, `"make header sticky with blur"`, `"change text to English"`
 
 ### Agent 4: Build & Auto-Fix
-- Chạy `npm run build` (`next build`)
+- Chạy `php -l` cho mỗi file PHP
 - Nếu lỗi → parse error output → đọc broken files → gửi LLM fix → retry (max 5 lần)
-- Smart import/export detection: khi lỗi "has no exported member" → đọc cả target module
+- Smart detection: PHP syntax errors, missing includes, undefined functions
 - Rate limit handling: auto retry 429 với exponential backoff
-- Post-build: **Runtime check** — start dev server, fetch tất cả pages, bắt HTTP 500 / TypeError (max 3 retries auto-fix)
+- Post-build: **Runtime check** — start PHP dev server, fetch pages, bắt Fatal/Parse errors (max 3 retries auto-fix)
 - **Review**: Mở `http://localhost:3456` xem website → approve / change / regenerate
 - Ví dụ change: `"fix product cards - images too small"`, `"add spacing between sections"`, `"change font size"`
 
 ### Agent 5: Test Runner
-- Chạy `npm test`
-- Output: test results
-- **Review**: Xem test output → approve / change / regenerate
-- Ví dụ change: `"add test for contact form validation"`, `"skip failing tests"`
+- Chạy `php -l` validation cho tất cả PHP files
+- Output: lint results
+- **Review**: Xem validation output → approve / change / regenerate
+- Ví dụ change: `"fix PHP syntax errors"`, `"add missing function"`
 
 ### Agent 6: Git Commit
 - `git init` + `git add .` + `git commit -m "..."`
@@ -290,7 +288,7 @@ Component animations: `fade-in`, `slide-up` keyframes cho entrance effects.
 ## Security & Sandboxing
 
 - **Path traversal blocked**: Tất cả file I/O qua `resolveSafe()` — kiểm tra path không escape workspace
-- **Command allow-list**: Chỉ cho phép `npm`, `pnpm`, `npx`, `git`, `node`, `tsc`
+- **Command allow-list**: Chỉ cho phép `php`, `wp`, `zip`, `git`, `node`, `tsc`
 - **Rate limit retry**: Auto backoff khi bị Claude API 429
 - **Timeout**: Command execution timeout 120s
 - **API key isolation**: `.env` git-ignored, không bao giờ log key
@@ -303,11 +301,10 @@ Component animations: `fade-in`, `slide-up` keyframes cho entrance effects.
 | `rate_limit_error 429` | Vượt 30K input tokens/phút | Agent sẽ auto retry (30-90s backoff) |
 | `Unterminated string in JSON` | Response bị truncated | Giảm batch size hoặc tăng `max_tokens` |
 | `mgt.clearMarks is not a function` | VS Code terminal bug | Chạy ngoài Terminal.app, ignore warning |
-| CSS không apply | `postcss.config` format sai | Dùng `.js` (CommonJS), không dùng `@apply` trong `@layer` |
+| PHP syntax error | Thiếu `;` hoặc sai cú pháp | Build-fix agent sẽ auto-detect và fix |
 | `Cannot find module 'agent.js'` | Chưa compile TypeScript | Chạy `npm run build` trước |
-| Import/export mismatch | Claude gen batched không nhất quán | Build-fix agent sẽ auto-detect và fix |
-| `ENOENT: BUILD_ID` | Chưa build mà chạy `npm start` | Dùng `npm run dev` hoặc `npm run build && npm start` |
-| Runtime TypeError 500 | Component dùng data undefined | Runtime check sẽ auto-fix (thêm `?.`, `?? []`) |
+| Undefined function | Thiếu `require_once` hoặc hàm chưa định nghĩa | Build-fix agent sẽ auto-detect file cần include |
+| Runtime Fatal error | PHP template lỗi runtime | Runtime check sẽ auto-fix (thêm `isset()`, `??`) |
 | Agent fail giữa chừng | API error / build error | Resume: `node dist/agent.js --resume ./output/project-xxx` |
 | Resume không thấy checkpoint | Chưa approve agent nào | Chạy ít nhất 1 agent và approve trước khi quit |
 
