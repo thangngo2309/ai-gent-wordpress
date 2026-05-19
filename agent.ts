@@ -1798,6 +1798,12 @@ CRITICAL rules (violating these causes errors):
 - No React, No JSX, No TypeScript, No Tailwind, No Next.js
 - For images: use <img> tags or inline style="background-image: url('...')" with picsum.photos URLs
 - Every file must be COMPLETE — no TODOs, no placeholders, no "..." shortcuts
+- Do NOT use WooCommerce APIs, WooCommerce functions, WC(), wc_get_cart_url(), cart, checkout, or plugin-dependent code unless the user's idea explicitly requests WooCommerce.
+- Generated themes must run in a plain local PHP preview/router without any WordPress plugins active.
+- NEVER call WC()->cart directly.
+- If WooCommerce support is explicitly required, always guard it:
+  function_exists('WC') && WC() && isset(WC()->cart) && is_object(WC()->cart)
+- If WooCommerce is unavailable, hide cart/checkout UI instead of throwing errors.
 - Return ONLY the ${batch.length} file(s) listed above`;
 
       log("INFO", `Batch ${batchIdx + 1}/${batches.length}: generating ${batch.map((f) => f.filePath).join(", ")}`);
@@ -2340,6 +2346,8 @@ Common causes:
 - Missing ABSPATH check at top of files
 - Wrong function signatures or missing parameters
 - Missing closing PHP tags or syntax errors
+- Plugin-dependent code: WooCommerce functions such as WC(), wc_get_cart_url(), WC()->cart may be unavailable or null in local preview.
+- Fix by removing WooCommerce dependency unless explicitly requested, or guard all WooCommerce calls.
 
 RULES:
 - Fix the root cause, don't just suppress errors
