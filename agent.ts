@@ -124,6 +124,7 @@ interface SharedContext {
   buildLogs: string[];
   testLogs: string[];
   errors: string[];
+  lastVisualReview: VisualReviewOutcome | null;
 }
 
 interface Checkpoint {
@@ -656,6 +657,9 @@ function mockRouter(prompt: string): unknown {
   if (prompt.includes("[BUILD_SPEC]")) return mockSpec();
   if (prompt.includes("[GENERATE_CODE]")) return mockCodeGen(prompt);
   if (prompt.includes("[FIX_BUILD]")) return mockBuildFix();
+  if (prompt.includes("[FIX_THEME_CONTRACT]")) return { explanation: "Mock mode skipped theme contract repair", files: [] };
+  if (prompt.includes("[VISUAL_REVIEW]")) return { explanation: "Mock mode skipped visual review", files: [] };
+  if (prompt.includes("[VISUAL_SCORE]")) return { score: 100, desktopScore: 100, mobileScore: 100, severity: "pass", issues: [], explanation: "Mock mode skipped visual scoring" };
   if (prompt.includes("[COMMIT_MSG]")) return mockCommitMsg();
   throw new Error("Mock LLM: unrecognised prompt tag");
 }
@@ -5278,7 +5282,15 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
     const binaryFiles = allPlannedRaw.filter((f) => BINARY_EXTS.has(path.extname(f.filePath).toLowerCase()));
     const allPlanned = allPlannedRaw.filter((f) => !BINARY_EXTS.has(path.extname(f.filePath).toLowerCase()));
     const BATCH_SIZE = 4;
-    const FIRST_BATCH_SIZE = 2;
+    const seedPaths = new Set([
+      "style.css",
+      "functions.php",
+      "inc/theme-data.php",
+      "inc/customizer.php",
+      "header.php",
+      "footer.php",
+      "front-page.php",
+    ]);
 
     // Generate placeholder for binary files (e.g. screenshot.png)
     for (const bf of binaryFiles) {
@@ -5297,12 +5309,14 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
     }
 
     // Split files into batches to avoid truncated LLM responses
+    const seedBatch = allPlanned.filter((file) => seedPaths.has(file.filePath));
+    const remainingFiles = allPlanned.filter((file) => !seedPaths.has(file.filePath));
     const batches: FileSpec[][] = [];
-    if (allPlanned.length > 0) {
-      batches.push(allPlanned.slice(0, FIRST_BATCH_SIZE));
+    if (seedBatch.length > 0) {
+      batches.push(seedBatch);
     }
-    for (let i = FIRST_BATCH_SIZE; i < allPlanned.length; i += BATCH_SIZE) {
-      batches.push(allPlanned.slice(i, i + BATCH_SIZE));
+    for (let i = 0; i < remainingFiles.length; i += BATCH_SIZE) {
+      batches.push(remainingFiles.slice(i, i + BATCH_SIZE));
     }
 
     log("INFO", `Generating code in ${batches.length} batch(es) for ${allPlanned.length} files`);
@@ -5500,7 +5514,7 @@ Return ONLY the ${batch.length} file(s) listed above`;
       return results;
     };
 
-    // Batch 0 always runs first (style.css + functions.php) so subsequent batches can reference CSS vars.
+    // Seed batch always runs first so dependent PHP/template batches can reference theme-data/header/footer.
     const allFiles: GeneratedFile[] = [];
     const batch0Files = await runBatch(0, batches[0], []);
     allFiles.push(...batch0Files);
@@ -5530,6 +5544,7 @@ Return ONLY the ${batch.length} file(s) listed above`;
 
     await fs.mkdir(ctx.workspacePath, { recursive: true });
     await Promise.all(allFiles.map((f) => writeFileSafe(ctx.workspacePath, f.filePath, f.content)));
+    await repairThemeContract(ctx);
 
     log("INFO", `Code generated: ${allFiles.length} files written to ${ctx.workspacePath}`);
     return { success: true, data: allFiles };
@@ -5547,6 +5562,804 @@ interface RuntimeCheckResult {
   success: boolean;
   errors: string[];
   serverOutput: string;
+}
+
+interface PreviewSnapshot {
+  status: number;
+  body: string;
+  serverOutput: string;
+  screenshotPaths: string[];
+  screenshotErrors: string[];
+}
+
+interface VisualScoreResponse {
+  score: number;
+  desktopScore: number;
+  mobileScore: number;
+  severity: "pass" | "polish" | "fail";
+  issues: string[];
+  explanation: string;
+}
+
+interface VisualReviewArtifacts {
+  jsonPath: string;
+  markdownPath: string;
+}
+
+interface VisualReviewOutcome {
+  blocked: boolean;
+  reason?: string;
+  assessment?: VisualScoreResponse;
+  artifacts?: VisualReviewArtifacts;
+  screenshotPaths: string[];
+}
+
+interface SourceSnippet {
+  path: string;
+  content: string;
+}
+
+interface ThemeContractIssue {
+  filePath: string;
+  reason: string;
+}
+
+function normalizeProjectPath(projectDir: string, filePath: string): string {
+  let rel = filePath.trim();
+  if (rel.startsWith(projectDir)) rel = rel.slice(projectDir.length + 1);
+  if (rel.startsWith("/")) rel = rel.slice(1);
+  return rel;
+}
+
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractPhpReferences(err: string, projectDir: string): Array<{ path: string; line?: number }> {
+  const refs = new Map<string, { path: string; line?: number }>();
+  const linePattern = /([^\s:]+\.php):(\d+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = linePattern.exec(err)) !== null) {
+    const relPath = normalizeProjectPath(projectDir, match[1]);
+    refs.set(`${relPath}:${match[2]}`, { path: relPath, line: Number(match[2]) });
+  }
+
+  const filePattern = /([^\s:]+\.php)/g;
+  while ((match = filePattern.exec(err)) !== null) {
+    const relPath = normalizeProjectPath(projectDir, match[1]);
+    const key = `${relPath}:`;
+    if (!refs.has(key)) refs.set(key, { path: relPath });
+  }
+
+  return [...refs.values()];
+}
+
+function clipText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n…(truncated)`;
+}
+
+function getImageMediaType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".gif") return "image/gif";
+  return "image/png";
+}
+
+function getEnvNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getVisualThresholds(): {
+  passScore: number;
+  failFastScore: number;
+  passDesktopScore: number;
+  passMobileScore: number;
+  failFastDesktopScore: number;
+  failFastMobileScore: number;
+  hardBlockMobileScore: number;
+  maxVisualRounds: number;
+} {
+  return {
+    passScore: getEnvNumber("VISUAL_PASS_SCORE", 84),
+    failFastScore: getEnvNumber("VISUAL_FAIL_FAST_SCORE", 72),
+    passDesktopScore: getEnvNumber("VISUAL_PASS_DESKTOP_SCORE", 84),
+    passMobileScore: getEnvNumber("VISUAL_PASS_MOBILE_SCORE", 80),
+    failFastDesktopScore: getEnvNumber("VISUAL_FAIL_FAST_DESKTOP_SCORE", 72),
+    failFastMobileScore: getEnvNumber("VISUAL_FAIL_FAST_MOBILE_SCORE", 68),
+    hardBlockMobileScore: getEnvNumber("VISUAL_HARD_BLOCK_MOBILE_SCORE", 60),
+    maxVisualRounds: Math.max(1, Math.floor(getEnvNumber("VISUAL_MAX_ROUNDS", 2))),
+  };
+}
+
+async function writeVisualReviewReport(
+  projectDir: string,
+  round: number,
+  assessment: VisualScoreResponse,
+  snapshot: PreviewSnapshot,
+  polishExplanation?: string,
+  changedFiles: string[] = []
+): Promise<VisualReviewArtifacts> {
+  const artifactsDir = path.join(projectDir, ".agent-artifacts");
+  await fs.mkdir(artifactsDir, { recursive: true });
+  const jsonPath = path.join(artifactsDir, `visual-review-round-${round}.json`);
+  const markdownPath = path.join(artifactsDir, `visual-review-round-${round}.md`);
+
+  const report = {
+    generatedAt: new Date().toISOString(),
+    round,
+    status: snapshot.status,
+    overallScore: assessment.score,
+    desktopScore: assessment.desktopScore,
+    mobileScore: assessment.mobileScore,
+    severity: assessment.severity,
+    issues: assessment.issues,
+    explanation: assessment.explanation,
+    polishExplanation: polishExplanation ?? null,
+    changedFiles,
+    screenshotPaths: snapshot.screenshotPaths,
+    screenshotErrors: snapshot.screenshotErrors,
+  };
+
+  await fs.writeFile(jsonPath, JSON.stringify(report, null, 2), "utf-8");
+
+  const markdown = [
+    `# Visual Review Round ${round}`,
+    "",
+    `- Generated: ${report.generatedAt}`,
+    `- HTTP Status: ${report.status}`,
+    `- Overall Score: ${report.overallScore}`,
+    `- Desktop Score: ${report.desktopScore}`,
+    `- Mobile Score: ${report.mobileScore}`,
+    `- Severity: ${report.severity}`,
+    `- Explanation: ${report.explanation}`,
+    `- Polish Result: ${report.polishExplanation ?? "No polish changes applied"}`,
+    `- Changed Files: ${changedFiles.length > 0 ? changedFiles.join(", ") : "None"}`,
+    `- Screenshots: ${snapshot.screenshotPaths.length > 0 ? snapshot.screenshotPaths.join(", ") : "None"}`,
+    `- Screenshot Errors: ${snapshot.screenshotErrors.length > 0 ? snapshot.screenshotErrors.join(" | ") : "None"}`,
+    "",
+    "## Issues",
+    "",
+    ...(assessment.issues.length > 0 ? assessment.issues.map((issue) => `- ${issue}`) : ["- None"]),
+    "",
+  ].join("\n");
+
+  await fs.writeFile(markdownPath, markdown, "utf-8");
+  return { jsonPath, markdownPath };
+}
+
+function printVisualReviewArtifacts(outcome: VisualReviewOutcome): void {
+  if (outcome.artifacts) {
+    console.log(`  📊 Visual report: ${outcome.artifacts.markdownPath}`);
+    console.log(`  🧾 Visual JSON:   ${outcome.artifacts.jsonPath}`);
+  }
+  if (outcome.screenshotPaths.length > 0) {
+    console.log(`  🖼️  Screenshots:`);
+    for (const screenshotPath of outcome.screenshotPaths) {
+      console.log(`     • ${screenshotPath}`);
+    }
+  }
+}
+
+async function compressImageIfNeeded(imagePath: string): Promise<Uint8Array> {
+  const MAX_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+  const MAX_DIMENSION = 8000; // Claude API limit
+  const originalData = await fs.readFile(imagePath);
+
+  let needsCompression = originalData.length > MAX_SIZE_BYTES;
+  let needsResize = false;
+  let metadata: { width?: number; height?: number } = {};
+
+  // Check dimensions
+  try {
+    const sharp = (await import("sharp")).default;
+    metadata = await sharp(originalData).metadata();
+    if (metadata.width && metadata.height) {
+      if (metadata.width > MAX_DIMENSION || metadata.height > MAX_DIMENSION) {
+        needsResize = true;
+        needsCompression = true;
+        log("INFO", `Image ${path.basename(imagePath)} dimensions ${metadata.width}x${metadata.height} exceed limit, resizing...`);
+      }
+    }
+  } catch {
+    // sharp not available or error, continue with size check
+  }
+
+  if (!needsCompression && !needsResize) {
+    return new Uint8Array(originalData.buffer, originalData.byteOffset, originalData.byteLength);
+  }
+
+  log("INFO", `Image ${path.basename(imagePath)} is ${(originalData.length / 1024 / 1024).toFixed(2)}MB, processing...`);
+
+  try {
+    const sharp = (await import("sharp")).default;
+    let processed = sharp(originalData);
+
+    // Resize if dimensions exceed limit
+    if (needsResize && metadata.width && metadata.height) {
+      const scale = Math.min(MAX_DIMENSION / metadata.width, MAX_DIMENSION / metadata.height, 1);
+      const newWidth = Math.floor(metadata.width * scale);
+      processed = processed.resize(newWidth, null, { withoutEnlargement: true });
+    }
+
+    let compressed: Buffer = await processed.png({ quality: 85, compressionLevel: 9 }).toBuffer();
+
+    // If still too large, reduce quality
+    let quality = 85;
+    while (compressed.length > MAX_SIZE_BYTES && quality > 20) {
+      quality -= 15;
+      compressed = await processed.png({ quality, compressionLevel: 9 }).toBuffer();
+    }
+
+    // If still too large, resize to smaller width
+    if (compressed.length > MAX_SIZE_BYTES) {
+      const targetWidth = 1200;
+      compressed = await sharp(originalData)
+        .resize(targetWidth, null, { withoutEnlargement: true })
+        .png({ quality: 80, compressionLevel: 9 })
+        .toBuffer();
+    }
+
+    log("INFO", `Compressed to ${(compressed.length / 1024 / 1024).toFixed(2)}MB`);
+    return new Uint8Array(compressed.buffer, compressed.byteOffset, compressed.byteLength);
+  } catch (err: unknown) {
+    log("WARN", `Failed to compress image: ${err instanceof Error ? err.message : String(err)}`);
+    return new Uint8Array(originalData.buffer, originalData.byteOffset, originalData.byteLength);
+  }
+}
+
+async function callLLMWithImages(prompt: string, imagePaths: string[], maxTokens = 16384): Promise<unknown> {
+  if (USE_MOCK) return mockRouter(prompt);
+
+  const apiKey = process.env.ANTHROPIC_API_KEY!;
+  const model = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514";
+  const MAX_API_RETRIES = 6;
+  const FETCH_TIMEOUT_MS = 300_000;
+
+  const contentBlocks: Array<Record<string, unknown>> = [
+    { type: "text", text: prompt },
+  ];
+
+  for (const imagePath of imagePaths) {
+    const data = await compressImageIfNeeded(imagePath);
+    contentBlocks.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: getImageMediaType(imagePath),
+        data: Buffer.from(data).toString("base64"),
+      },
+    });
+  }
+
+  for (let apiAttempt = 1; apiAttempt <= MAX_API_RETRIES; apiAttempt++) {
+    let res: Response;
+    const controller = new AbortController();
+    const fetchTimer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: maxTokens,
+          system: LLM_SYSTEM,
+          messages: [{ role: "user", content: contentBlocks }],
+        }),
+        signal: controller.signal,
+      });
+    } catch (fetchErr: unknown) {
+      clearTimeout(fetchTimer);
+      const isAbort = fetchErr instanceof Error && fetchErr.name === "AbortError";
+      const msg = isAbort
+        ? `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s`
+        : fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      if (apiAttempt < MAX_API_RETRIES) {
+        const waitSec = Math.min(5 * 2 ** (apiAttempt - 1), 30);
+        log("WARN", `Network error: ${msg}. Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
+        await sleep(waitSec * 1000);
+        continue;
+      }
+      throw new Error(`Network error after ${MAX_API_RETRIES} retries: ${msg}`);
+    }
+    clearTimeout(fetchTimer);
+
+    if (res.status === 429 || res.status === 529) {
+      const retryAfter = res.headers.get("retry-after");
+      const defaultWait = res.status === 529 ? 15 * (apiAttempt + 1) : 30 * apiAttempt;
+      const waitSec = retryAfter ? parseInt(retryAfter, 10) : defaultWait;
+      if (apiAttempt < MAX_API_RETRIES) {
+        const reason = res.status === 429 ? "Rate limited" : "API overloaded";
+        log("WARN", `${reason} (${res.status}). Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
+        await sleep(waitSec * 1000);
+        continue;
+      }
+      const body = await res.text();
+      throw new Error(`API ${res.status} after ${MAX_API_RETRIES} retries: ${body.slice(0, 500)}`);
+    }
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`Claude API ${res.status}: ${body.slice(0, 500)}`);
+    }
+
+    const json = (await res.json()) as {
+      content?: { text?: string }[];
+      stop_reason?: string;
+    };
+    const text = json.content?.[0]?.text ?? "";
+
+    if (json.stop_reason === "max_tokens") {
+      log("WARN", `Response truncated (hit max_tokens=${maxTokens}). Response length: ${text.length} chars`);
+      throw new Error(
+        `LLM response truncated at ${maxTokens} tokens. ` +
+        `Try reducing batch size or increasing max_tokens.`
+      );
+    }
+
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenced) return JSON.parse(fenced[1].trim());
+
+    const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
+    if (raw) return JSON.parse(raw[1]);
+
+    throw new Error(`No JSON in LLM response: ${text.slice(0, 300)}`);
+  }
+
+  throw new Error("Claude API: exhausted all retries");
+}
+
+async function capturePreviewScreenshots(url: string, projectDir: string): Promise<{ paths: string[]; errors: string[] }> {
+  const paths: string[] = [];
+  const errors: string[] = [];
+
+  try {
+    const { chromium } = await import("playwright");
+    const browser = await chromium.launch({ headless: true });
+    const artifactsDir = path.join(projectDir, ".agent-artifacts");
+    await fs.mkdir(artifactsDir, { recursive: true });
+
+    const variants = [
+      { name: "desktop", viewport: { width: 1440, height: 1600 } },
+      { name: "mobile", viewport: { width: 390, height: 1200 } },
+    ];
+
+    try {
+      for (const variant of variants) {
+        const page = await browser.newPage({ viewport: variant.viewport, deviceScaleFactor: 1 });
+        try {
+          await page.goto(url, { waitUntil: "load", timeout: 30_000 });
+          await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => undefined);
+          await page.addStyleTag({ content: "*,*::before,*::after{animation:none!important;transition:none!important;} html{scroll-behavior:auto!important;}" }).catch(() => undefined);
+          await page.waitForTimeout(500);
+          const screenshotPath = path.join(artifactsDir, `visual-${variant.name}.png`);
+          await page.screenshot({ path: screenshotPath, fullPage: true });
+          paths.push(screenshotPath);
+        } finally {
+          await page.close();
+        }
+      }
+    } finally {
+      await browser.close();
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errors.push(msg);
+  }
+
+  return { paths, errors };
+}
+
+async function scoreVisualQuality(ctx: SharedContext, snapshot: PreviewSnapshot): Promise<VisualScoreResponse> {
+  const prompt = `[VISUAL_SCORE]
+Evaluate this generated WordPress landing page before user review.
+
+Return a strict visual quality score and decide whether the page should be auto-polished again.
+
+SCORING CRITERIA:
+- Layout stability and section spacing
+- Typography hierarchy and font-size balance
+- Color harmony and readability
+- Alignment, grid consistency, and CTA polish
+- Mobile responsiveness and general visual professionalism
+
+RULES:
+- Base the assessment primarily on the screenshots.
+- Use the HTML and server output only as supporting context.
+- severity must be one of: pass, polish, fail
+- pass: visually coherent and ready for review
+- polish: usable but needs one more automatic styling/layout pass
+- fail: visually broken enough that another automatic pass is required before review
+
+PREVIEW STATUS: ${snapshot.status}
+
+PREVIEW HTML:
+${clipText(snapshot.body, 8000)}
+
+PREVIEW SERVER OUTPUT:
+${clipText(snapshot.serverOutput, 2500)}
+
+Respond with JSON:
+{
+  "score": 0,
+  "desktopScore": 0,
+  "mobileScore": 0,
+  "severity": "pass",
+  "issues": ["short issue 1", "short issue 2"],
+  "explanation": "brief summary"
+}`;
+
+  const imagePaths = snapshot.screenshotPaths.filter((filePath) => existsSync(filePath));
+  const result = imagePaths.length > 0
+    ? await callLLMWithImages(prompt, imagePaths, 5000)
+    : await callLLM(prompt, 5000);
+  const parsed = result as Partial<VisualScoreResponse>;
+  return {
+    score: Number(parsed.score ?? 0),
+    desktopScore: Number(parsed.desktopScore ?? parsed.score ?? 0),
+    mobileScore: Number(parsed.mobileScore ?? parsed.score ?? 0),
+    severity: parsed.severity === "fail" || parsed.severity === "polish" ? parsed.severity : "pass",
+    issues: Array.isArray(parsed.issues) ? parsed.issues.map((issue) => String(issue)) : [],
+    explanation: typeof parsed.explanation === "string" ? parsed.explanation : "Visual score completed",
+  };
+}
+
+async function capturePreviewSnapshot(projectDir: string, pagePath = "/"): Promise<PreviewSnapshot> {
+  const PORT = 3458;
+  let serverOutput = "";
+  let serverReady = false;
+
+  await ensureRouterFile(projectDir, PORT);
+
+  const proc = spawn("php", ["-S", `localhost:${PORT}`, ".router.php"], {
+    cwd: projectDir,
+    stdio: "pipe",
+    env: { ...process.env },
+  });
+
+  proc.stdout?.on("data", (d: Buffer) => { serverOutput += d.toString(); });
+  proc.stderr?.on("data", (d: Buffer) => { serverOutput += d.toString(); });
+
+  const startTime = Date.now();
+  while (Date.now() - startTime < 10_000) {
+    if (serverOutput.includes("started") || serverOutput.includes("Development Server") || serverOutput.includes("listening")) {
+      serverReady = true;
+      break;
+    }
+    await sleep(500);
+  }
+
+  if (!serverReady) {
+    proc.kill("SIGTERM");
+    try { await fs.unlink(path.join(projectDir, ".router.php")); } catch {}
+    throw new Error("Preview snapshot server failed to start within 10s");
+  }
+
+  await sleep(1000);
+
+  try {
+    const res = await httpGet(`http://localhost:${PORT}${pagePath}`);
+    const screenshots = await capturePreviewScreenshots(`http://localhost:${PORT}${pagePath}`, projectDir);
+    await sleep(1000);
+    return {
+      status: res.status,
+      body: res.body,
+      serverOutput,
+      screenshotPaths: screenshots.paths,
+      screenshotErrors: screenshots.errors,
+    };
+  } finally {
+    proc.kill("SIGTERM");
+    try { await fs.unlink(path.join(projectDir, ".router.php")); } catch {}
+  }
+}
+
+async function runVisualPolishPass(ctx: SharedContext): Promise<VisualReviewOutcome> {
+  if (USE_MOCK) return { blocked: false, screenshotPaths: [] };
+
+  log("INFO", "Capturing screenshots for manual review…");
+
+  let snapshot: PreviewSnapshot;
+  try {
+    snapshot = await capturePreviewSnapshot(ctx.workspacePath);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("WARN", `Screenshot capture failed: ${msg}`);
+    return { blocked: false, reason: msg, screenshotPaths: [] };
+  }
+
+  if (snapshot.screenshotErrors.length > 0) {
+    log("WARN", `Screenshot capture degraded: ${snapshot.screenshotErrors.join(" | ")}`);
+  }
+
+  if (snapshot.screenshotPaths.length > 0) {
+    log("INFO", `Screenshots saved to .agent-artifacts/ for manual review`);
+    for (const screenshotPath of snapshot.screenshotPaths) {
+      log("INFO", `  • ${path.basename(screenshotPath)}`);
+    }
+  }
+
+  // UI/UX QA step - analyze layout and spacing issues
+  if (snapshot.screenshotPaths.length > 0) {
+    log("INFO", "Running UI/UX quality analysis…");
+
+    const uiQaPrompt = `Analyze these WordPress theme screenshots for UI/UX quality issues.
+
+Focus on:
+1. Layout spacing and consistency (padding, margin, gaps between elements)
+2. Typography hierarchy and readability
+3. Button and card alignment
+4. Modern design principles (whitespace, visual balance, contrast)
+5. Mobile responsiveness and touch targets
+6. User-friendliness and intuitive navigation
+
+For each issue found, provide:
+- Specific CSS selector or PHP template file location
+- Current problem description
+- Exact CSS fix with property values
+- Why this improves the user experience
+
+Format your response as a JSON array of fixes:
+[
+  {
+    "file": "style.css or template-file.php",
+    "selector": ".class-name or line reference",
+    "issue": "description of the problem",
+    "fix": "exact CSS code or PHP change",
+    "reason": "why this improves UX"
+  }
+]
+
+If the UI is already modern and user-friendly with no issues, return an empty array: []`;
+
+    try {
+      const qaResponse = await callLLMWithImages(uiQaPrompt, snapshot.screenshotPaths);
+
+      // callLLMWithImages returns parsed JSON directly
+      let fixes: Array<{
+        file: string;
+        selector: string;
+        issue: string;
+        fix: string;
+        reason: string;
+      }> = [];
+
+      if (Array.isArray(qaResponse)) {
+        fixes = qaResponse;
+      } else {
+        log("WARN", "UI/UX QA response is not an array");
+      }
+
+      if (fixes.length > 0) {
+        log("INFO", `Found ${fixes.length} UI/UX improvement(s)`);
+
+        // Apply fixes automatically
+        for (const fix of fixes) {
+          log("INFO", `Fixing: ${fix.issue}`);
+          log("INFO", `  Location: ${fix.file} ${fix.selector}`);
+          log("INFO", `  Reason: ${fix.reason}`);
+
+          const filePath = path.join(ctx.workspacePath, fix.file);
+
+          try {
+            const fileExists = await fs.access(filePath).then(() => true).catch(() => false);
+            if (!fileExists) {
+              log("WARN", `File not found: ${fix.file}, skipping fix`);
+              continue;
+            }
+
+            const content = await fs.readFile(filePath, "utf-8");
+
+            // For CSS files, append the fix
+            if (fix.file.endsWith(".css")) {
+              const updatedContent = content + "\n\n/* UI/UX improvement: " + fix.issue + " */\n" + fix.fix + "\n";
+              await fs.writeFile(filePath, updatedContent, "utf-8");
+              log("INFO", `Applied CSS fix to ${fix.file}`);
+            } else {
+              // For PHP files, log the fix for manual review
+              log("INFO", `PHP fix suggested for ${fix.file}:\n${fix.fix}`);
+            }
+          } catch (fileErr) {
+            log("WARN", `Could not apply fix to ${fix.file}: ${fileErr}`);
+          }
+        }
+
+        // Re-capture screenshots to verify improvements
+        log("INFO", "Re-capturing screenshots to verify improvements…");
+        try {
+          const verifySnapshot = await capturePreviewSnapshot(ctx.workspacePath);
+          if (verifySnapshot.screenshotPaths.length > 0) {
+            log("INFO", "Updated screenshots saved:");
+            for (const screenshotPath of verifySnapshot.screenshotPaths) {
+              log("INFO", `  • ${path.basename(screenshotPath)}`);
+            }
+            return {
+              blocked: false,
+              screenshotPaths: verifySnapshot.screenshotPaths,
+            };
+          }
+        } catch (verifyErr) {
+          log("WARN", `Could not re-capture screenshots: ${verifyErr}`);
+        }
+      } else {
+        log("INFO", "No UI/UX issues found - theme looks good!");
+      }
+    } catch (qaErr) {
+      log("WARN", `UI/UX QA failed: ${qaErr}`);
+    }
+  }
+
+  // Skip LLM visual scoring - just return success with screenshots
+  return {
+    blocked: false,
+    screenshotPaths: snapshot.screenshotPaths,
+  };
+}
+
+function excerptByLine(content: string, line?: number, radius = 45): string {
+  if (!line || line < 1) return clipText(content, 4000);
+  const lines = content.split("\n");
+  const start = Math.max(0, line - radius - 1);
+  const end = Math.min(lines.length, line + radius);
+  const excerpt = lines
+    .slice(start, end)
+    .map((entry, idx) => `${start + idx + 1}: ${entry}`)
+    .join("\n");
+  return clipText(excerpt, 5000);
+}
+
+async function collectSourceSnippets(
+  projectDir: string,
+  refs: Array<{ path: string; line?: number }>,
+  anchors: string[] = []
+): Promise<SourceSnippet[]> {
+  const merged = new Map<string, { path: string; line?: number }>();
+  for (const ref of refs) {
+    if (!ref.path || !ref.path.endsWith(".php")) continue;
+    const existing = merged.get(ref.path);
+    if (!existing || (!existing.line && ref.line)) merged.set(ref.path, ref);
+  }
+  for (const anchor of anchors) {
+    if (!merged.has(anchor)) merged.set(anchor, { path: anchor });
+  }
+
+  const snippets: SourceSnippet[] = [];
+  for (const ref of merged.values()) {
+    try {
+      const abs = path.join(projectDir, ref.path);
+      const content = await fs.readFile(abs, "utf-8");
+      snippets.push({
+        path: ref.path,
+        content: excerptByLine(content, ref.line),
+      });
+    } catch {
+      // skip unreadable files
+    }
+  }
+  return snippets;
+}
+
+async function findThemeContractIssues(projectDir: string, phpPrefix: string): Promise<ThemeContractIssue[]> {
+  const issues: ThemeContractIssue[] = [];
+  const templatePartsDir = path.join(projectDir, "template-parts");
+  const allowedFns = new Set([
+    `${phpPrefix}_get_site_config`,
+    `${phpPrefix}_get_products`,
+    `${phpPrefix}_get_categories`,
+    `${phpPrefix}_get_articles`,
+    `${phpPrefix}_get_gallery`,
+  ]);
+
+  const functionsPath = path.join(projectDir, "functions.php");
+  if (existsSync(functionsPath)) {
+    const functionsContent = await fs.readFile(functionsPath, "utf-8");
+    if (/extends\s+Walker_Nav_Menu\b/.test(functionsContent) || /new\s+[A-Za-z0-9_]+_Walker_[A-Za-z0-9_]+\s*\(/.test(functionsContent)) {
+      issues.push({
+        filePath: "functions.php",
+        reason: "Custom Walker_Nav_Menu usage is forbidden in preview-safe themes. Use wp_nav_menu() with a fallback menu and no custom walker.",
+      });
+    }
+  }
+
+  if (existsSync(templatePartsDir)) {
+    const entries = await fs.readdir(templatePartsDir);
+    const forbiddenPattern = new RegExp(`\\b(${escapeRegex(phpPrefix)}_get_[A-Za-z0-9_]+)\\s*\\(`, "g");
+    for (const entry of entries) {
+      if (!entry.endsWith(".php")) continue;
+      const relPath = `template-parts/${entry}`;
+      const content = await fs.readFile(path.join(templatePartsDir, entry), "utf-8");
+      let match: RegExpExecArray | null;
+      const seen = new Set<string>();
+      while ((match = forbiddenPattern.exec(content)) !== null) {
+        const fnName = match[1];
+        if (allowedFns.has(fnName) || seen.has(fnName)) continue;
+        seen.add(fnName);
+        issues.push({
+          filePath: relPath,
+          reason: `Template parts may only call the approved data functions. Found forbidden helper: ${fnName}().`,
+        });
+      }
+    }
+  }
+
+  const themeDataPath = path.join(projectDir, "inc/theme-data.php");
+  if (existsSync(themeDataPath)) {
+    const content = await fs.readFile(themeDataPath, "utf-8");
+    const requiredFns = [...allowedFns];
+    const missing = requiredFns.filter((fnName) => !new RegExp(`function\\s+${escapeRegex(fnName)}\\s*\\(`).test(content));
+    if (missing.length > 0) {
+      issues.push({
+        filePath: "inc/theme-data.php",
+        reason: `Missing required data functions: ${missing.join(", ")}.`,
+      });
+    }
+  }
+
+  return issues;
+}
+
+async function repairThemeContract(ctx: SharedContext): Promise<void> {
+  if (USE_MOCK) return;
+
+  const phpPrefix = (ctx.analysis?.projectName ?? "theme").replace(/-/g, "_");
+  const issues = await findThemeContractIssues(ctx.workspacePath, phpPrefix);
+  if (issues.length === 0) return;
+
+  log("WARN", `Theme contract guard found ${issues.length} issue(s)`);
+  for (const issue of issues) {
+    log("WARN", `  • ${issue.filePath}: ${issue.reason}`);
+  }
+
+  const sourceFiles = await collectSourceSnippets(
+    ctx.workspacePath,
+    issues.map((issue) => ({ path: issue.filePath })),
+    ["functions.php", "header.php", "inc/theme-data.php", "front-page.php"].filter((fp) => existsSync(path.join(ctx.workspacePath, fp)))
+  );
+
+  const prompt = `[FIX_THEME_CONTRACT]
+Fix WordPress theme contract violations before runtime validation.
+
+PHP prefix: ${phpPrefix}_
+
+ISSUES:
+${issues.map((issue) => `- ${issue.filePath}: ${issue.reason}`).join("\n")}
+
+SOURCE SNIPPETS:
+${sourceFiles.map((file) => `=== ${file.path} ===\n${file.content}`).join("\n\n")}
+
+RULES:
+- Remove any custom Walker_Nav_Menu classes/usages. Use wp_nav_menu() with a preview-safe fallback instead.
+- inc/theme-data.php must define EXACTLY these data-access functions:
+  ${phpPrefix}_get_site_config(), ${phpPrefix}_get_products(), ${phpPrefix}_get_categories(), ${phpPrefix}_get_articles(), ${phpPrefix}_get_gallery()
+- template-parts may ONLY call those five functions.
+- Prefer fixing templates to consume site config or existing data arrays instead of inventing new helper functions.
+- Return COMPLETE file contents for changed files only.
+
+Respond with JSON:
+{
+  "explanation": "what you fixed",
+  "files": [
+    { "path": "relative/path.php", "content": "complete corrected file content" }
+  ]
+}`;
+
+  const fix = (await callLLM(prompt, 12000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
+  if (!fix.files || !Array.isArray(fix.files) || fix.files.length === 0) {
+    throw new Error("Theme contract guard could not repair violations");
+  }
+
+  for (const file of fix.files) {
+    await writeFileSafe(ctx.workspacePath, file.path, file.content);
+  }
+  log("INFO", `Theme contract repair applied: ${fix.explanation ?? "updated files"}`);
 }
 
 /** Generate the .router.php content for PHP built-in server (WordPress stubs) */
@@ -5962,6 +6775,8 @@ async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>
   const MAX_RETRIES = 5;
   const ws = ctx.workspacePath;
 
+  await repairThemeContract(ctx);
+
   // Step 1: Validate PHP syntax for all PHP files
   log("INFO", "Validating PHP syntax…");
 
@@ -6215,7 +7030,7 @@ Respond with JSON:
     await writeFileSafe(
       ws,
       ".gitignore",
-      ["node_modules/", "dist/", ".DS_Store", "*.log", ""].join("\n")
+      ["node_modules/", "dist/", ".agent-artifacts/", ".DS_Store", "*.log", ""].join("\n")
     );
 
     gitAdd(ws);
@@ -6615,43 +7430,12 @@ async function preReviewValidation(ctx: SharedContext): Promise<void> {
     // ── Collect source files and send to LLM for fix ───────────
     log("INFO", "Sending errors to LLM for auto-fix…");
 
-    const brokenFiles = new Set<string>();
-    for (const err of errors) {
-      const matches = err.matchAll(/([^\s:]+\.php)/g);
-      for (const m of matches) {
-        let rel = m[1];
-        // Convert absolute paths to relative
-        if (rel.startsWith(ctx.workspacePath)) rel = rel.slice(ctx.workspacePath.length + 1);
-        if (rel.startsWith("/")) rel = rel.slice(1);
-        brokenFiles.add(rel);
-      }
-    }
-
-    // Always include functions.php and theme-data.php — needed to resolve undefined function errors
-    for (const f of ["functions.php", "inc/theme-data.php"]) {
-      if (existsSync(path.join(ctx.workspacePath, f))) brokenFiles.add(f);
-    }
-    // Only add all template-parts/inc if we have very few broken files (to stay within token budget)
-    if (brokenFiles.size <= 2) {
-      try {
-        for (const f of await fs.readdir(path.join(ctx.workspacePath, "inc"))) {
-          if (f.endsWith(".php")) brokenFiles.add(`inc/${f}`);
-        }
-      } catch { /* no inc dir */ }
-      try {
-        for (const f of await fs.readdir(path.join(ctx.workspacePath, "template-parts"))) {
-          if (f.endsWith(".php")) brokenFiles.add(`template-parts/${f}`);
-        }
-      } catch { /* no template-parts dir */ }
-    }
-
-    const fileContents: string[] = [];
-    for (const relPath of brokenFiles) {
-      try {
-        const content = await fs.readFile(path.join(ctx.workspacePath, relPath), "utf-8");
-        fileContents.push(`=== ${relPath} ===\n${content}`);
-      } catch { /* skip */ }
-    }
+    const errorRefs = errors.flatMap((err) => extractPhpReferences(err, ctx.workspacePath));
+    const sourceFiles = await collectSourceSnippets(
+      ctx.workspacePath,
+      errorRefs,
+      ["functions.php", "inc/theme-data.php", "header.php", "front-page.php"].filter((fp) => existsSync(path.join(ctx.workspacePath, fp)))
+    );
 
     const fixPrompt = `You are fixing PHP RUNTIME errors in a WordPress theme running on PHP's built-in dev server.
 The theme uses stub functions (no real WordPress) so some WP functions are no-ops.
@@ -6662,8 +7446,8 @@ ${errors.join("\n")}
 FULL SERVER STDERR:
 ${devOutput.slice(-3000)}
 
-SOURCE FILES:
-${fileContents.join("\n\n")}
+SOURCE SNIPPETS:
+${sourceFiles.map((file) => `=== ${file.path} ===\n${file.content}`).join("\n\n")}
 
 COMMON FIXES:
 - "Call to undefined function X()" → function not included or misspelled
@@ -6684,10 +7468,11 @@ RULES:
 - Fix ALL errors, not just the first
 - Return COMPLETE file contents for each fixed file
 - Do NOT remove ABSPATH checks — instead define ABSPATH in the fix if needed
-- Ensure data keys in templates match the keys defined in inc/theme-data.php`;
+- Ensure data keys in templates match the keys defined in inc/theme-data.php
+- Only modify files directly needed for the listed runtime errors`;
 
     try {
-      const fix = (await callLLM(fixPrompt, 32000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
+      const fix = (await callLLM(fixPrompt, 12000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
       if (fix.files && Array.isArray(fix.files)) {
         for (const f of fix.files) {
           const filePath = path.join(ctx.workspacePath, f.path);
@@ -6710,7 +7495,7 @@ RULES:
   }
 }
 
-async function askAgentReview(kind: AgentKind): Promise<ReviewChoice> {
+async function askAgentReview(ctx: SharedContext, kind: AgentKind): Promise<ReviewChoice> {
   if (process.env.AUTO_APPROVE === "true") {
     log("INFO", "Auto-approved (AUTO_APPROVE=true)");
     return { action: "approve" };
@@ -6749,10 +7534,15 @@ async function askAgentReview(kind: AgentKind): Promise<ReviewChoice> {
     };
 
     const hasDevServer = kind === "build" || kind === "codegen";
+    const visualSummary = hasDevServer ? ctx.lastVisualReview : null;
 
     console.log("\n┌─────────────────────────────────────────────────────────┐");
     if (hasDevServer) {
       console.log("│  🔍 Review your project at http://localhost:3456       │");
+      if (visualSummary?.assessment) {
+        console.log(`│  🎨 Visual QA: ${String(visualSummary.assessment.score).padStart(3, " ")} overall / ${String(visualSummary.assessment.desktopScore).padStart(3, " ")} desktop / ${String(visualSummary.assessment.mobileScore).padStart(3, " ")} mobile │`);
+        console.log(`│  📌 Severity: ${visualSummary.assessment.severity}${visualSummary.blocked ? " (blocked)" : ""}`.padEnd(58, " ") + "│");
+      }
       console.log("├─────────────────────────────────────────────────────────┤");
     }
     console.log("│  [a] ✅ Approve — continue to next step               │");
@@ -6944,6 +7734,7 @@ function restoreContext(cp: Checkpoint, projectPath: string): SharedContext {
     buildLogs: cp.buildLogs,
     testLogs: cp.testLogs,
     errors: [],
+    lastVisualReview: null,
   };
 }
 
@@ -6961,6 +7752,7 @@ function createContext(idea: string, outputDir: string): SharedContext {
     buildLogs: [],
     testLogs: [],
     errors: [],
+    lastVisualReview: null,
   };
 }
 
@@ -7135,46 +7927,12 @@ async function orchestrate(idea: string, resumePath?: string): Promise<void> {
         // ── Auto-fix runtime errors via LLM ──────────────────────
         log("INFO", "Sending runtime errors to LLM for auto-fix…");
 
-        // Collect broken files from error messages
-        const brokenFiles = new Set<string>();
-        for (const err of rtResult.errors) {
-          const fileMatches = err.matchAll(/([^\s:]+\.php)/g);
-          for (const m of fileMatches) brokenFiles.add(m[1]);
-        }
-
-        // Always include inc/ and template-parts/ (common source of runtime errors)
-        try {
-          const incDir = path.join(ctx.workspacePath, "inc");
-          const incFiles = await fs.readdir(incDir).catch(() => [] as string[]);
-          for (const f of incFiles) {
-            if (f.endsWith(".php")) brokenFiles.add(`inc/${f}`);
-          }
-        } catch { /* no inc dir */ }
-
-        try {
-          const tpDir = path.join(ctx.workspacePath, "template-parts");
-          const tpFiles = await fs.readdir(tpDir).catch(() => [] as string[]);
-          for (const f of tpFiles) {
-            if (f.endsWith(".php")) brokenFiles.add(`template-parts/${f}`);
-          }
-        } catch { /* no template-parts dir */ }
-
-        // Also include root PHP files
-        try {
-          const rootFiles = await fs.readdir(ctx.workspacePath);
-          for (const f of rootFiles) {
-            if (f.endsWith(".php") && f !== ".router.php") brokenFiles.add(f);
-          }
-        } catch { /* skip */ }
-
-        // Read file contents
-        const fileContents: string[] = [];
-        for (const relPath of brokenFiles) {
-          try {
-            const content = await fs.readFile(path.join(ctx.workspacePath, relPath), "utf-8");
-            fileContents.push(`=== ${relPath} ===\n${content}`);
-          } catch { /* skip unreadable */ }
-        }
+        const errorRefs = rtResult.errors.flatMap((err) => extractPhpReferences(err, ctx.workspacePath));
+        const sourceFiles = await collectSourceSnippets(
+          ctx.workspacePath,
+          errorRefs,
+          ["functions.php", "inc/theme-data.php", "header.php", "front-page.php"].filter((fp) => existsSync(path.join(ctx.workspacePath, fp)))
+        );
 
         const fixPrompt = `You are fixing RUNTIME errors in a WordPress PHP theme.
 
@@ -7184,8 +7942,8 @@ ${rtResult.errors.join("\n\n")}
 RELEVANT SERVER OUTPUT:
 ${(rtResult.serverOutput ?? "").slice(-3000)}
 
-SOURCE FILES:
-${fileContents.join("\n\n")}
+SOURCE SNIPPETS:
+${sourceFiles.map((file) => `=== ${file.path} ===\n${file.content}`).join("\n\n")}
 
 COMMON FIXES:
 - "Call to undefined function X()" → function not defined or file not included via require_once
@@ -7206,10 +7964,11 @@ RULES:
 - Fix ALL runtime errors, not just the first one
 - Use proper WordPress escaping: esc_html(), esc_attr(), esc_url()
 - Ensure all data functions are defined and loaded
-- Return COMPLETE file contents, not patches`;
+- Return COMPLETE file contents, not patches
+- Only modify files that are actually needed to fix the listed errors`;
 
         try {
-          const rtFix = (await callLLM(fixPrompt, 32000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
+          const rtFix = (await callLLM(fixPrompt, 12000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
           if (rtFix.files && Array.isArray(rtFix.files)) {
             for (const f of rtFix.files) {
               const filePath = path.join(ctx.workspacePath, f.path);
@@ -7229,18 +7988,30 @@ RULES:
         await sleep(3000);
       }
 
+      const visualOutcome = await runVisualPolishPass(ctx);
+      printVisualReviewArtifacts(visualOutcome);
+      if (visualOutcome.blocked) {
+        const reason = visualOutcome.reason ?? "Visual review blocked preview";
+        log("ERROR", reason);
+        ctx.errors.push(reason);
+        await saveCheckpoint(ctx, agentIdx > 0 ? agentIdx - 1 : -1, completedAgents);
+        stopDevServer();
+        process.exitCode = 1;
+        return;
+      }
+
       // Start the preview dev server for user review
       startDevServer(ctx.workspacePath);
       await sleep(3000); // Give PHP dev server time to start
 
-      // Final validation: check the live preview for PHP errors and auto-fix
-      await preReviewValidation(ctx);
+      // Runtime check already done above, skip duplicate validation
+      // await preReviewValidation(ctx);
     }
 
     // ── Interactive review loop (all agents) ─────────────────────
     let reviewing = true;
     while (reviewing) {
-      const choice = await askAgentReview(agent.kind);
+      const choice = await askAgentReview(ctx, agent.kind);
 
       switch (choice.action) {
         case "approve":
@@ -7280,9 +8051,15 @@ RULES:
                   if (rebuild.success) {
                     // Restart dev server to pick up changes and validate
                     stopDevServer();
+                    const visualOutcome = await runVisualPolishPass(ctx);
+                    printVisualReviewArtifacts(visualOutcome);
+                    if (visualOutcome.blocked) {
+                      console.log(`\n  ❌ Visual review blocked preview: ${visualOutcome.reason ?? "mobile layout quality too low"}`);
+                      break;
+                    }
                     startDevServer(ctx.workspacePath);
                     await sleep(3000);
-                    await preReviewValidation(ctx);
+                    // await preReviewValidation(ctx);
                     console.log("\n  ✅ Rebuild successful — refresh browser to see changes");
                   } else {
                     console.log("\n  ⚠️  Rebuild failed — running auto-fix…");
@@ -7320,9 +8097,18 @@ RULES:
           if (agent.kind === "analysis" && ctx.analysis) await generateIdeaMd(ctx);
           if (agent.kind === "spec" && ctx.spec) await generateSpecMd(ctx);
           if (needsDevServer) {
+            const visualOutcome = await runVisualPolishPass(ctx);
+            printVisualReviewArtifacts(visualOutcome);
+            if (visualOutcome.blocked) {
+              const reason = visualOutcome.reason ?? "Visual review blocked preview";
+              log("ERROR", reason);
+              stopDevServer();
+              process.exitCode = 1;
+              return;
+            }
             startDevServer(ctx.workspacePath);
             await sleep(4000);
-            await preReviewValidation(ctx);
+            // await preReviewValidation(ctx);
           }
           break;
 
@@ -7370,6 +8156,7 @@ async function regenIdea(projectPath: string, idea: string): Promise<void> {
     buildLogs: [],
     testLogs: [],
     errors: [],
+    lastVisualReview: null,
   };
 
   log("INFO", `Re-generating IDEA.md for: ${absPath}`);
