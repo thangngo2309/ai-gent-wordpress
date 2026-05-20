@@ -24,7 +24,7 @@ import * as http from "node:http";
 import { Dirent, existsSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
-import { execSync, spawn, ChildProcess } from "node:child_process";
+import { execSync, spawn, exec, ChildProcess } from "node:child_process";
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  TYPES
@@ -243,6 +243,28 @@ function execSafe(
   }
 }
 
+async function execSafeAsync(
+  command: string,
+  cwd: string,
+  timeoutMs = 30_000
+): Promise<{ stdout: string; success: boolean }> {
+  const bin = command.split(/\s+/)[0];
+  if (!ALLOWED_BINS.has(bin)) {
+    throw new Error(`Blocked command "${bin}". Allowed: ${[...ALLOWED_BINS].join(", ")}`);
+  }
+  log("DEBUG", `exec (async): ${command}`, { cwd });
+  return new Promise((resolve) => {
+    exec(command, { cwd, timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (!err) {
+        resolve({ stdout: stdout.trim(), success: true });
+      } else {
+        const out = [stdout, stderr].filter(Boolean).join("\n").trim();
+        resolve({ stdout: out || err.message, success: false });
+      }
+    });
+  });
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 //  DESIGN SYSTEM — Creative guidelines for Claude (no rigid HTML template)
@@ -270,6 +292,11 @@ Choose a cohesive color palette that matches the user's topic. Include:
 - --color-border (borders and dividers)
 - --color-accent, --color-accent-foreground (highlights, CTAs)
 
+⚠️  CSS VARIABLE DISCIPLINE — CRITICAL:
+- ONLY use var(--X) for properties that are explicitly declared in :root.
+- Never reference a variable without defining it first. If you need a darker primary, define --color-primary-dark in :root.
+- Text on colored backgrounds MUST use the corresponding -foreground token to ensure WCAG contrast.
+
 ### CSS Architecture (style.css + assets/css/custom.css)
 - style.css MUST have the WordPress theme header comment at the very top
 - Use CSS custom properties for colors (var(--color-primary) etc.)
@@ -277,6 +304,9 @@ Choose a cohesive color palette that matches the user's topic. Include:
 - Use CSS Grid and Flexbox for layouts
 - Use @keyframes for animations (fade-in, slide-up, slide-in-left)
 - Media queries for responsive: mobile-first approach
+- Image wrappers must have overflow: hidden; images must have height + object-fit: cover to prevent layout shift
+- ⚠️  FIXED HEADER OFFSET: If .site-header uses position: fixed or position: sticky, body MUST have padding-top equal to the header height (e.g. \`body { padding-top: var(--header-height, 80px); }\`). Add \`--header-height: 80px\` to :root.
+- ⚠️  CSS–PHP CLASS SYNC: Every CSS selector you write (.section-about__stats-cards, .section-categories__grid, etc.) MUST exactly match the \`class="..."\` attribute used in the corresponding PHP template. Do NOT define \`.categories-grid\` if the PHP template uses \`class="section-categories__grid"\`. Write CSS classes to match PHP, or write PHP to match CSS — but they MUST be identical.
 
 ### CSS Reset & Base (in style.css after theme header)
 \`\`\`css
@@ -291,8 +321,11 @@ body {
   line-height: 1.6;
 }
 html { scroll-behavior: smooth; }
-img { max-width: 100%; height: auto; display: block; }
+img { max-width: 100%; height: auto; display: block; object-fit: cover; }
 a { text-decoration: none; color: inherit; }
+@media (prefers-reduced-motion: no-preference) {
+  a { transition: color 0.2s ease; }
+}
 
 .container { max-width: 1280px; margin: 0 auto; padding: 0 1rem; }
 @media (min-width: 768px) { .container { padding: 0 2.5rem; } }
@@ -307,26 +340,36 @@ a { text-decoration: none; color: inherit; }
 .btn-primary {
   display: inline-flex; align-items: center; justify-content: center;
   background-color: var(--color-primary, #0ea5e9);
-  color: #ffffff; padding: 0.75rem 1.5rem; border-radius: 0.5rem;
-  font-weight: 600; transition: all 0.3s; border: none; cursor: pointer;
+  color: var(--color-primary-foreground, #ffffff);
+  padding: 0.75rem 1.5rem; border-radius: 0.5rem;
+  font-weight: 600; border: none; cursor: pointer;
 }
-.btn-primary:hover { opacity: 0.9; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+@media (prefers-reduced-motion: no-preference) {
+  .btn-primary { transition: opacity 0.3s, box-shadow 0.3s; }
+  .btn-primary:hover { opacity: 0.9; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+}
 .btn-primary:focus-visible { outline: 3px solid var(--color-primary, #0ea5e9); outline-offset: 2px; }
 .btn-outline {
   display: inline-flex; align-items: center; justify-content: center;
   border: 2px solid var(--color-primary, #0ea5e9);
   color: var(--color-primary, #0ea5e9);
   padding: 0.75rem 1.5rem; border-radius: 0.5rem;
-  font-weight: 600; transition: all 0.3s; background: transparent; cursor: pointer;
+  font-weight: 600; background: transparent; cursor: pointer;
 }
-.btn-outline:hover { background-color: var(--color-primary, #0ea5e9); color: #ffffff; }
+@media (prefers-reduced-motion: no-preference) {
+  .btn-outline { transition: background-color 0.3s, color 0.3s; }
+  .btn-outline:hover { background-color: var(--color-primary, #0ea5e9); color: var(--color-primary-foreground, #ffffff); }
+}
 .btn-outline:focus-visible { outline: 3px solid var(--color-primary, #0ea5e9); outline-offset: 2px; }
 
 /* Skip-to-content link (accessibility — always include) */
 .skip-to-content {
   position: absolute; top: -40px; left: 0; background: var(--color-primary, #0ea5e9);
-  color: #ffffff; padding: 0.5rem 1rem; z-index: 100; border-radius: 0 0 0.25rem 0;
-  transition: top 0.2s;
+  color: var(--color-primary-foreground, #ffffff); padding: 0.5rem 1rem; z-index: 100;
+  border-radius: 0 0 0.25rem 0;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .skip-to-content { transition: top 0.2s; }
 }
 .skip-to-content:focus { top: 0; }
 
@@ -408,8 +451,29 @@ const REQUIRED_FILE_STRUCTURE = `
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  WP SECURITY RULES — Derived from wp-plugin-development skill (security.md)
+//  DESIGN_SYSTEM_PHP — Compact reference for PHP-only batches (no CSS code examples)
+//  Injected in place of the full DESIGN_SYSTEM when the batch has no .css file.
 // ─────────────────────────────────────────────────────────────────────────────
+
+const DESIGN_SYSTEM_PHP = `
+### Design Reference (PHP files — consult style.css for full CSS rules)
+
+**Fonts**: 'Inter' (body), 'Playfair Display' (display headings)
+
+**Available CSS tokens** (always use var(--X), never bare hex):
+- Colors: --color-primary, --color-primary-foreground, --color-secondary, --color-secondary-foreground,
+  --color-accent, --color-accent-foreground, --color-background, --color-foreground,
+  --color-muted, --color-muted-foreground, --color-card, --color-card-foreground,
+  --color-border, --color-destructive, --color-destructive-foreground
+- Spacing: --space-xs, --space-sm, --space-md, --space-lg, --space-xl, --space-2xl, --space-3xl
+- Type: --text-xs, --text-sm, --text-base, --text-lg, --text-xl, --text-2xl, --text-3xl, --text-4xl, --text-5xl
+- Radius: --radius-sm, --radius-md, --radius-lg, --radius-full
+- Shadow: --shadow-sm, --shadow-md, --shadow-lg, --shadow-xl, --shadow-2xl
+
+**Design principles**: Premium, modern aesthetic. Glass morphism on nav. Bold hero. BEM CSS naming.
+All images via loremflickr.com with topic-relevant keywords. Semantic HTML5 landmarks.
+`;
+
 
 const WP_SECURITY_RULES = `
 ### WordPress Security Rules (apply to every PHP file)
@@ -472,9 +536,13 @@ function gitCommit(
 const USE_MOCK = !process.env.ANTHROPIC_API_KEY;
 
 const LLM_SYSTEM =
-  "You are a senior full-stack engineer. " +
-  "Respond ONLY with valid JSON — no markdown fences, no explanations. " +
-  "Return the raw JSON object or array directly.";
+  "You are a senior WordPress theme developer and CSS expert. " +
+  "Respond ONLY with valid JSON — no markdown fences, no prose explanations outside the JSON. " +
+  "Return the raw JSON object or array directly. " +
+  "When generating CSS: (1) every var(--X) reference must have a matching :root declaration in the same style.css, " +
+  "(2) transition/animation rules must be inside @media (prefers-reduced-motion: no-preference) blocks, " +
+  "(3) never use bare hex colors for text or backgrounds — always use CSS custom properties. " +
+  "When generating PHP: every template file must start with <?php, check ABSPATH, and use WordPress escaping functions.";
 
 async function callLLM(prompt: string, maxTokens = 16384): Promise<unknown> {
   log("DEBUG", `LLM call (${USE_MOCK ? "MOCK" : "LIVE"}) — prompt ${prompt.length} chars, maxTokens ${maxTokens}`);
@@ -491,9 +559,13 @@ async function claudeAPI(prompt: string, maxTokens = 16384): Promise<unknown> {
   const model = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514";
 
   const MAX_API_RETRIES = 6;
+  // Max time to wait for a single fetch (large theme batches can exceed 3 minutes under API load)
+  const FETCH_TIMEOUT_MS = 300_000;
 
   for (let apiAttempt = 1; apiAttempt <= MAX_API_RETRIES; apiAttempt++) {
     let res: Response;
+    const controller = new AbortController();
+    const fetchTimer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
       res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -508,18 +580,25 @@ async function claudeAPI(prompt: string, maxTokens = 16384): Promise<unknown> {
           system: LLM_SYSTEM,
           messages: [{ role: "user", content: prompt }],
         }),
+        signal: controller.signal,
       });
     } catch (fetchErr: unknown) {
-      // Network-level errors: connection reset, DNS failure, timeout, etc.
-      const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      clearTimeout(fetchTimer);
+      // Network-level errors: connection reset, DNS failure, AbortError (timeout), etc.
+      const isAbort = fetchErr instanceof Error && fetchErr.name === "AbortError";
+      const msg = isAbort
+        ? `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s`
+        : fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
       if (apiAttempt < MAX_API_RETRIES) {
-        const waitSec = 15 * apiAttempt;
+        // Exponential backoff: 5s, 10s, 20s, 30s, 30s — much faster than linear 15×N
+        const waitSec = Math.min(5 * 2 ** (apiAttempt - 1), 30);
         log("WARN", `Network error: ${msg}. Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
         await sleep(waitSec * 1000);
         continue;
       }
       throw new Error(`Network error after ${MAX_API_RETRIES} retries: ${msg}`);
     }
+    clearTimeout(fetchTimer);
 
     // Handle rate limiting (429) and overloaded (529) with exponential backoff
     if (res.status === 429 || res.status === 529) {
@@ -829,6 +908,8 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  --color-border: #e2e8f0;",
         "  --color-accent: #f59e0b;",
         "  --color-accent-foreground: #ffffff;",
+        "  --color-electric-blue: #0284c7;",
+        "  --color-tech-purple: #7c3aed;",
         "  ",
         "  --color-dark: #1e293b;",
         "  --color-light: #f1f5f9;",
@@ -899,7 +980,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "a {",
         "  text-decoration: none;",
         "  color: inherit;",
-        "  transition: all 0.2s ease;",
         "}",
         "",
         "a:hover {",
@@ -966,7 +1046,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  z-index: 100;",
         "  border-radius: 0 0 var(--radius-sm) 0;",
         "  font-weight: 600;",
-        "  transition: top 0.2s ease;",
         "}",
         "",
         ".skip-to-content:focus {",
@@ -1001,7 +1080,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border: none;",
         "  cursor: pointer;",
         "  text-decoration: none;",
-        "  transition: all 0.3s ease;",
         "  position: relative;",
         "  overflow: hidden;",
         "}",
@@ -1082,7 +1160,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border-radius: var(--radius-lg);",
         "  padding: var(--space-lg);",
         "  box-shadow: var(--shadow-sm);",
-        "  transition: all 0.3s ease;",
         "}",
         "",
         "@media (prefers-reduced-motion: no-preference) {",
@@ -1343,7 +1420,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border-radius: var(--radius-lg);",
         "  overflow: hidden;",
         "  box-shadow: var(--shadow-md);",
-        "  transition: all 0.3s ease;",
         "}",
         "",
         "@media (prefers-reduced-motion: no-preference) {",
@@ -1357,7 +1433,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  width: 100%;",
         "  height: 250px;",
         "  object-fit: cover;",
-        "  transition: transform 0.3s ease;",
         "}",
         "",
         "@media (prefers-reduced-motion: no-preference) {",
@@ -1396,7 +1471,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border-radius: var(--radius-lg);",
         "  overflow: hidden;",
         "  cursor: pointer;",
-        "  transition: transform 0.3s ease;",
         "}",
         "",
         "@media (prefers-reduced-motion: no-preference) {",
@@ -1409,7 +1483,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  width: 100%;",
         "  height: 100%;",
         "  object-fit: cover;",
-        "  transition: transform 0.3s ease;",
         "}",
         "",
         "@media (prefers-reduced-motion: no-preference) {",
@@ -1430,7 +1503,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  justify-content: center;",
         "  color: white;",
         "  text-align: center;",
-        "  transition: background 0.3s ease;",
         "}",
         "",
         "@media (prefers-reduced-motion: no-preference) {",
@@ -1451,7 +1523,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border-radius: var(--radius-lg);",
         "  overflow: hidden;",
         "  box-shadow: var(--shadow-sm);",
-        "  transition: all 0.3s ease;",
         "}",
         "",
         "@media (prefers-reduced-motion: no-preference) {",
@@ -1509,7 +1580,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  left: 0;",
         "  right: 0;",
         "  z-index: 50;",
-        "  transition: all 0.3s ease;",
         "}",
         "",
         ".site-header--scrolled {",
@@ -1550,7 +1620,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "",
         ".nav-menu a {",
         "  font-weight: 500;",
-        "  transition: color 0.2s ease;",
         "}",
         "",
         ".nav-menu a:hover,",
@@ -1594,7 +1663,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         ".footer-section a {",
         "  color: var(--color-light);",
         "  opacity: 0.8;",
-        "  transition: opacity 0.2s ease;",
         "}",
         "",
         ".footer-section a:hover,",
@@ -1628,7 +1696,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  align-items: center;",
         "  justify-content: center;",
         "  box-shadow: var(--shadow-lg);",
-        "  transition: all 0.3s ease;",
         "  opacity: 0;",
         "  visibility: hidden;",
         "  z-index: 40;",
@@ -1796,7 +1863,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: var(--text-sm);",
         "  font-weight: 600;",
         "  color: rgba(255, 255, 255, 0.9);",
-        "  transition: color 0.2s ease;",
         "  padding: var(--space-xs) 0;",
         "  white-space: nowrap;",
         "}",
@@ -1857,7 +1923,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  height: 2px;",
         "  background: currentColor;",
         "  border-radius: 2px;",
-        "  transition: all 0.3s ease;",
         "}",
         "",
         ".site-header__menu-text {",
@@ -2047,7 +2112,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  display: inline-flex;",
         "  align-items: center;",
         "  gap: var(--space-xs);",
-        "  transition: all 0.3s ease;",
         "  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);",
         "}",
         "",
@@ -2069,7 +2133,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  display: inline-flex;",
         "  align-items: center;",
         "  gap: var(--space-xs);",
-        "  transition: all 0.3s ease;",
         "}",
         "",
         ".section-hero__cta-secondary:hover {",
@@ -2252,7 +2315,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  overflow: hidden;",
         "  display: flex;",
         "  flex-direction: column;",
-        "  transition: all 0.3s ease;",
         "  box-shadow: var(--shadow-sm);",
         "}",
         "",
@@ -2275,7 +2337,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  width: 100%;",
         "  height: 100%;",
         "  object-fit: cover;",
-        "  transition: transform 0.4s ease;",
         "  display: block;",
         "}",
         "",
@@ -2309,7 +2370,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  align-items: center;",
         "  justify-content: center;",
         "  opacity: 0;",
-        "  transition: opacity 0.3s ease;",
         "  z-index: 3;",
         "}",
         "",
@@ -2433,7 +2493,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-weight: 700;",
         "  border-radius: var(--radius-md);",
         "  cursor: pointer;",
-        "  transition: all 0.25s ease;",
         "  text-align: center;",
         "}",
         "",
@@ -2528,7 +2587,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  display: flex;",
         "  flex-direction: column;",
         "  height: auto !important;            /* override old fixed height */",
-        "  transition: all 0.3s ease;",
         "  cursor: pointer;",
         "}",
         "",
@@ -2553,7 +2611,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  height: 100%;",
         "  object-fit: cover;",
         "  display: block;",
-        "  transition: transform 0.4s ease;",
         "}",
         "",
         ".category-card:hover .category-card__img {",
@@ -2568,7 +2625,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  display: flex;",
         "  align-items: flex-end;",
         "  z-index: 1;",
-        "  transition: background 0.3s ease;",
         "}",
         "",
         ".category-card:hover .category-card__overlay {",
@@ -2642,7 +2698,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-weight: 700;",
         "  padding: 0.45rem 1rem;",
         "  border-radius: var(--radius-md);",
-        "  transition: all 0.2s ease;",
         "  text-decoration: none;",
         "  border: none;",
         "}",
@@ -2653,7 +2708,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "}",
         "",
         ".category-card__btn-icon {",
-        "  transition: transform 0.2s ease;",
         "}",
         "",
         ".category-card__btn:hover .category-card__btn-icon {",
@@ -2733,7 +2787,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.9rem;",
         "  font-weight: 500;",
         "  border-radius: 6px;",
-        "  transition: background 0.2s, color 0.2s;",
         "  white-space: nowrap;",
         "}",
         ".main-navigation ul li a:hover,",
@@ -3021,7 +3074,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border: 1px solid #e2e8f0;",
         "  border-radius: 16px;",
         "  box-shadow: 0 2px 12px rgba(0,0,0,0.05);",
-        "  transition: transform 0.2s, box-shadow 0.2s;",
         "}",
         ".certification-card:hover {",
         "  transform: translateY(-4px);",
@@ -3101,7 +3153,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  background: #f8fafc;",
         "  border: 1px solid #e2e8f0;",
         "  border-radius: 14px;",
-        "  transition: box-shadow 0.2s;",
         "}",
         ".capability-card:hover { box-shadow: 0 8px 24px rgba(0,0,0,0.08); }",
         ".capability-card__icon {",
@@ -3189,7 +3240,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border-radius: 8px;",
         "  color: #94a3b8;",
         "  text-decoration: none;",
-        "  transition: background 0.2s, color 0.2s;",
         "}",
         ".site-footer__social-link:hover { background: #2563eb; color: #fff; }",
         ".site-footer__heading {",
@@ -3214,7 +3264,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.875rem;",
         "  color: #94a3b8;",
         "  text-decoration: none;",
-        "  transition: color 0.2s;",
         "  display: inline-block;",
         "}",
         ".site-footer__nav-link:hover { color: #fff; }",
@@ -3255,7 +3304,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.8rem;",
         "  color: #64748b;",
         "  text-decoration: none;",
-        "  transition: color 0.2s;",
         "}",
         ".site-footer__legal-link:hover { color: #94a3b8; }",
         "",
@@ -3305,7 +3353,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  display: inline-flex;",
         "  align-items: center;",
         "  gap: 0.5rem;",
-        "  transition: box-shadow 0.2s, transform 0.2s;",
         "}",
         ".about-cta__actions .btn-primary:hover {",
         "  box-shadow: 0 8px 24px rgba(0,0,0,0.2);",
@@ -3319,7 +3366,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  display: flex;",
         "  align-items: center;",
         "  gap: 0.5rem;",
-        "  transition: color 0.2s;",
         "}",
         ".about-cta__phone:hover { color: #fff; }",
         "@media (max-width: 768px) {",
@@ -3376,7 +3422,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border-radius: 1.25rem;",
         "  overflow: hidden;",
         "  box-shadow: 0 4px 24px rgba(15,23,42,0.08);",
-        "  transition: box-shadow 0.3s, transform 0.3s;",
         "}",
         ".featured-article:hover {",
         "  box-shadow: 0 12px 40px rgba(15,23,42,0.14);",
@@ -3392,7 +3437,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  height: 100%;",
         "  object-fit: cover;",
         "  display: block;",
-        "  transition: transform 0.5s ease;",
         "}",
         ".featured-article:hover .featured-article__img { transform: scale(1.04); }",
         ".featured-article__overlay {",
@@ -3489,7 +3533,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  background: linear-gradient(135deg, #2563eb, #0891b2);",
         "  color: #fff;",
         "  border: none;",
-        "  transition: box-shadow 0.2s, transform 0.2s;",
         "}",
         ".featured-article__actions .btn-primary:hover {",
         "  box-shadow: 0 6px 20px rgba(37,99,235,0.35);",
@@ -3504,7 +3547,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  color: #64748b;",
         "  display: flex;",
         "  align-items: center;",
-        "  transition: background 0.2s, color 0.2s;",
         "}",
         ".featured-article__bookmark:hover { background: #eff6ff; color: #2563eb; }",
         "",
@@ -3522,7 +3564,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  box-shadow: 0 2px 12px rgba(15,23,42,0.06);",
         "  display: flex;",
         "  flex-direction: column;",
-        "  transition: box-shadow 0.3s, transform 0.3s;",
         "}",
         ".article-card:hover {",
         "  box-shadow: 0 8px 32px rgba(15,23,42,0.12);",
@@ -3538,7 +3579,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  height: 100%;",
         "  object-fit: cover;",
         "  display: block;",
-        "  transition: transform 0.4s ease;",
         "}",
         ".article-card:hover .article-card__img { transform: scale(1.05); }",
         ".article-card__overlay {",
@@ -3619,7 +3659,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.8125rem;",
         "  font-weight: 600;",
         "  text-decoration: none;",
-        "  transition: gap 0.2s;",
         "}",
         ".article-card__link:hover { gap: 0.625rem; }",
         ".article-card__stats { display: flex; align-items: center; gap: 0.25rem; }",
@@ -3677,7 +3716,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  color: #fff;",
         "  font-size: 0.9375rem;",
         "  outline: none;",
-        "  transition: border-color 0.2s, background 0.2s;",
         "}",
         ".newsletter-signup__input::placeholder { color: rgba(255,255,255,0.5); }",
         ".newsletter-signup__input:focus {",
@@ -3694,7 +3732,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.875rem;",
         "  cursor: pointer;",
         "  white-space: nowrap;",
-        "  transition: box-shadow 0.2s, transform 0.2s;",
         "}",
         ".newsletter-signup__btn:hover {",
         "  box-shadow: 0 6px 20px rgba(0,0,0,0.2);",
@@ -3777,7 +3814,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.875rem;",
         "  font-weight: 600;",
         "  cursor: pointer;",
-        "  transition: background 0.2s, color 0.2s, border-color 0.2s;",
         "}",
         ".gallery-filter:hover {",
         "  background: #eff6ff;",
@@ -3802,7 +3838,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  overflow: hidden;",
         "  background: #f8fafc;",
         "  box-shadow: 0 2px 12px rgba(15,23,42,0.06);",
-        "  transition: box-shadow 0.3s, transform 0.3s;",
         "}",
         ".gallery-item:hover {",
         "  box-shadow: 0 10px 36px rgba(15,23,42,0.14);",
@@ -3818,7 +3853,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  height: 100%;",
         "  object-fit: cover;",
         "  display: block;",
-        "  transition: transform 0.5s ease;",
         "}",
         ".gallery-item:hover .gallery-item__image { transform: scale(1.06); }",
         ".gallery-item__overlay {",
@@ -3826,7 +3860,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  inset: 0;",
         "  background: linear-gradient(to top, rgba(15,23,42,0.88) 0%, rgba(15,23,42,0.2) 60%, transparent 100%);",
         "  opacity: 0;",
-        "  transition: opacity 0.3s;",
         "  display: flex;",
         "  align-items: flex-end;",
         "}",
@@ -3891,7 +3924,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.75rem;",
         "  font-weight: 600;",
         "  cursor: pointer;",
-        "  transition: background 0.2s;",
         "  backdrop-filter: blur(4px);",
         "}",
         ".gallery-item__view-btn:hover { background: rgba(255,255,255,0.3); }",
@@ -3906,7 +3938,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  border: 1px solid rgba(255,255,255,0.3);",
         "  border-radius: 0.375rem;",
         "  cursor: pointer;",
-        "  transition: background 0.2s;",
         "  text-decoration: none;",
         "  backdrop-filter: blur(4px);",
         "}",
@@ -3947,7 +3978,6 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  font-size: 0.9375rem;",
         "  font-weight: 600;",
         "  cursor: pointer;",
-        "  transition: background 0.2s, color 0.2s;",
         "}",
         ".gallery-load-more:hover { background: #2563eb; color: #fff; }",
         ".gallery-load-more__icon { transition: transform 0.2s; }",
@@ -3983,7 +4013,61 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "  .section-archives-gallery__grid { grid-template-columns: 1fr; }",
         "  .gallery-stats { grid-template-columns: repeat(2, 1fr); }",
         "}",
-        ""
+        "",
+        "/* Transitions — only apply when motion is acceptable */",
+        "@media (prefers-reduced-motion: no-preference) {",
+        "  a { transition: all 0.2s ease; }",
+        "  .skip-to-content { transition: top 0.2s ease; }",
+        "  .btn { transition: all 0.3s ease; }",
+        "  .card { transition: all 0.3s ease; }",
+        "  .product-card { transition: all 0.3s ease; }",
+        "  .product-card__image { transition: transform 0.3s ease; }",
+        "  .category-card { transition: transform 0.3s ease; }",
+        "  .category-card__image { transition: transform 0.3s ease; }",
+        "  .category-card__overlay { transition: background 0.3s ease; }",
+        "  .article-card { transition: all 0.3s ease; }",
+        "  .site-header { transition: all 0.3s ease; }",
+        "  .nav-menu a { transition: color 0.2s ease; }",
+        "  .footer-section a { transition: opacity 0.2s ease; }",
+        "  .back-to-top { transition: all 0.3s ease; }",
+        "  .site-header__menu a { transition: color 0.2s ease; }",
+        "  .site-header__menu-icon span { transition: all 0.3s ease; }",
+        "  .section-hero__cta-primary { transition: all 0.3s ease; }",
+        "  .section-hero__cta-secondary { transition: all 0.3s ease; }",
+        "  .product-card { transition: all 0.3s ease; }",
+        "  .product-card__image { transition: transform 0.4s ease; }",
+        "  .product-card__overlay { transition: opacity 0.3s ease; }",
+        "  .product-card__info { transition: all 0.25s ease; }",
+        "  .category-card { transition: all 0.3s ease; }",
+        "  .category-card__img { transition: transform 0.4s ease; }",
+        "  .category-card__overlay { transition: background 0.3s ease; }",
+        "  .category-card__btn { transition: all 0.2s ease; }",
+        "  .category-card__btn-icon { transition: transform 0.2s ease; }",
+        "  .site-header__menu li a { transition: background 0.2s, color 0.2s; }",
+        "  .certification-card { transition: transform 0.2s, box-shadow 0.2s; }",
+        "  .capability-card { transition: box-shadow 0.2s; }",
+        "  .site-footer__social-link { transition: background 0.2s, color 0.2s; }",
+        "  .site-footer__nav-link { transition: color 0.2s; }",
+        "  .site-footer__legal-link { transition: color 0.2s; }",
+        "  .about-cta__actions .btn-primary { transition: box-shadow 0.2s, transform 0.2s; }",
+        "  .about-cta__phone { transition: color 0.2s; }",
+        "  .featured-article { transition: box-shadow 0.3s, transform 0.3s; }",
+        "  .featured-article__img { transition: transform 0.5s ease; }",
+        "  .featured-article__actions .btn-primary { transition: box-shadow 0.2s, transform 0.2s; }",
+        "  .featured-article__bookmark { transition: background 0.2s, color 0.2s; }",
+        "  .article-card { transition: box-shadow 0.3s, transform 0.3s; }",
+        "  .article-card__img { transition: transform 0.4s ease; }",
+        "  .article-card__link { transition: gap 0.2s; }",
+        "  .newsletter-signup__input { transition: border-color 0.2s, background 0.2s; }",
+        "  .newsletter-signup__btn { transition: box-shadow 0.2s, transform 0.2s; }",
+        "  .gallery-filter { transition: background 0.2s, color 0.2s, border-color 0.2s; }",
+        "  .gallery-item { transition: box-shadow 0.3s, transform 0.3s; }",
+        "  .gallery-item__image { transition: transform 0.5s ease; }",
+        "  .gallery-item__overlay { transition: opacity 0.3s; }",
+        "  .gallery-item__view-btn { transition: background 0.2s; }",
+        "  .gallery-item__download-btn { transition: background 0.2s; }",
+        "  .gallery-load-more { transition: background 0.2s, color 0.2s; }",
+        "}",
       ].join("\n"),
     },
     {
@@ -5005,14 +5089,7 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
         "        btn.style.display = 'none';",
         "    }",
         "",
-        "    // Mobile menu toggle (placeholder for future enhancement)",
-        "    var menuToggle = document.getElementById('mobile-menu-toggle');",
-        "    var mobileNav = document.getElementById('mobile-nav');",
-        "    if (menuToggle && mobileNav) {",
-        "        menuToggle.addEventListener('click', function () {",
-        "            mobileNav.classList.toggle('is-open');",
-        "        });",
-        "    }",
+        "    // Keep JS aligned with rendered markup; do not query selectors that do not exist.",
         "})();",
         "",
       ].join("\n"),
@@ -5132,14 +5209,23 @@ Rules:
 
 async function specBuilder(ctx: SharedContext): Promise<AgentResult<ProjectSpec>> {
   try {
+    // Pass only the fields specBuilder needs — avoids burning tokens on features/userStories
+    const analysisForSpec = ctx.analysis ? {
+      projectName: ctx.analysis.projectName,
+      brandName: ctx.analysis.brandName,
+      summary: ctx.analysis.summary,
+      targetAudience: ctx.analysis.targetAudience,
+      designDirection: ctx.analysis.designDirection,
+      techStack: ctx.analysis.techStack,
+      features: ctx.analysis.features.map((f) => ({ name: f.name, priority: f.priority })),
+    } : ctx.analysis;
+
     const prompt = `[BUILD_SPEC]
 Create a detailed project specification for a WordPress theme.
+Theme uses: PHP template-parts pattern, WordPress Customizer API, vanilla CSS + JS. WCAG 2.1 AA.
 
 Analysis:
-${JSON.stringify(ctx.analysis, null, 2)}
-
-${DESIGN_SYSTEM}
-${WP_SECURITY_RULES}
+${JSON.stringify(analysisForSpec, null, 2)}
 
 Respond with JSON:
 {
@@ -5155,8 +5241,7 @@ Respond with JSON:
 ${REQUIRED_FILE_STRUCTURE}
 
 Do NOT include test files.
-Do NOT include any Node.js, Vite, Next.js, React, or Tailwind files.
-This is a pure WordPress PHP theme with WCAG 2.1 AA accessibility and WordPress security best practices.`;
+Do NOT include any Node.js, Vite, Next.js, React, or Tailwind files.`;
 
     const result = (await callLLM(prompt)) as ProjectSpec;
     ctx.spec = result;
@@ -5193,7 +5278,7 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
     const binaryFiles = allPlannedRaw.filter((f) => BINARY_EXTS.has(path.extname(f.filePath).toLowerCase()));
     const allPlanned = allPlannedRaw.filter((f) => !BINARY_EXTS.has(path.extname(f.filePath).toLowerCase()));
     const BATCH_SIZE = 4;
-    const allFiles: GeneratedFile[] = [];
+    const FIRST_BATCH_SIZE = 2;
 
     // Generate placeholder for binary files (e.g. screenshot.png)
     for (const bf of binaryFiles) {
@@ -5213,27 +5298,46 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
 
     // Split files into batches to avoid truncated LLM responses
     const batches: FileSpec[][] = [];
-    for (let i = 0; i < allPlanned.length; i += BATCH_SIZE) {
+    if (allPlanned.length > 0) {
+      batches.push(allPlanned.slice(0, FIRST_BATCH_SIZE));
+    }
+    for (let i = FIRST_BATCH_SIZE; i < allPlanned.length; i += BATCH_SIZE) {
       batches.push(allPlanned.slice(i, i + BATCH_SIZE));
     }
 
     log("INFO", `Generating code in ${batches.length} batch(es) for ${allPlanned.length} files`);
 
-    // Always generate package.json + config files first (batch 0)
-    for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-      const batch = batches[batchIdx];
+    const actualPrefix = (ctx.analysis?.projectName ?? "theme").replace(/-/g, "_");
+
+    /** Run one batch and return its generated files. seedFiles = already-generated files for context. */
+    const runBatch = async (batchIdx: number, batch: FileSpec[], seedFiles: GeneratedFile[]): Promise<GeneratedFile[]> => {
       const fileList = batch.map((f) => `  - ${f.filePath}: ${f.description}`).join("\n");
 
-      // Provide already-generated files as context so imports/deps stay consistent
-      // Prioritize showing type definitions and data files in full (they define the contract)
       const existingContext =
-        allFiles.length > 0
-          ? `\nAlready generated files (use these for reference — do NOT regenerate them):\n${allFiles.map((f) => {
-              const isTypeOrData = f.filePath.includes("types/") || f.filePath.includes("data/");
-              const limit = isTypeOrData ? 2000 : 500;
+        seedFiles.length > 0
+          ? `\nAlready generated files (use these for reference — do NOT regenerate them):\n${seedFiles.map((f) => {
+              const isStyleSheet = f.filePath === "style.css";
+              const isThemeData = f.filePath.includes("inc/") || f.filePath.includes("theme-data");
+              const isTemplatePart = f.filePath.includes("template-parts/");
+              const limit = isStyleSheet ? 4000 : isThemeData ? 3000 : isTemplatePart ? 1500 : 800;
               return `--- ${f.filePath} ---\n${f.content.slice(0, limit)}${f.content.length > limit ? "\n…(truncated)" : ""}`;
             }).join("\n")}\n`
           : "";
+
+      const cssVarsBlock = (() => {
+        const styleCss = seedFiles.find((f) => f.filePath === "style.css");
+        if (!styleCss) return "";
+        const rootMatch = styleCss.content.match(/:root\s*\{[^}]+\}/);
+        if (!rootMatch) return "";
+        const varNames = [...rootMatch[0].matchAll(/--[\w-]+/g)].map((m) => m[0]);
+        if (varNames.length === 0) return "";
+        const compact = varNames.join(", ");
+        const capped = compact.length > 1500 ? compact.slice(0, 1500) + "…" : compact;
+        return `\n⚠️  CSS variables defined in style.css (use ONLY these — never invent new var names):\n${capped}\n`;
+      })();
+
+      const batchHasCss = batch.some((f) => f.filePath.endsWith(".css"));
+      const designSystemForBatch = batchHasCss ? DESIGN_SYSTEM : DESIGN_SYSTEM_PHP;
 
       const prompt = `[GENERATE_CODE]
 Generate beautiful, production-quality WordPress theme code for a landing page.
@@ -5241,24 +5345,25 @@ Generate beautiful, production-quality WordPress theme code for a landing page.
 BE CREATIVE with the visual design — make it stunning, modern, and unique.
 The design should feel premium and polished, with thoughtful use of color, typography, and spacing.
 
-Project slug : ${ctx.analysis?.projectName}
-Brand name   : ${ctx.analysis?.brandName ?? ctx.idea}
-User's idea  : "${ctx.idea}"
+Project slug  : ${ctx.analysis?.projectName}
+Brand name    : ${ctx.analysis?.brandName ?? ctx.idea}
+PHP prefix    : ${actualPrefix}_  (ALL PHP functions MUST start with this prefix)
+Text domain   : ${ctx.analysis?.projectName}
+User's idea   : "${ctx.idea}"
 Full project file list: ${allPlanned.map((f) => f.filePath).join(", ")}
 
 ⚠️  BRAND & CONTENT RULES — follow exactly:
 - Theme Name in style.css header comment MUST be: "${ctx.analysis?.brandName ?? ctx.analysis?.projectName}"
 - Text Domain MUST be: "${ctx.analysis?.projectName}"
-- All PHP function prefixes MUST use: "${(ctx.analysis?.projectName ?? "theme").replace(/-/g, "_")}_"
+- All PHP function prefixes MUST use: "${actualPrefix}_"
 - The brand/company name shown in header, footer, and all copy IS: "${ctx.analysis?.brandName ?? ctx.idea}"
 - ALL product names, categories, articles, hero copy, about text MUST relate to: "${ctx.idea}"
 - Do NOT use "Premium Bikes", "bikes", "bicycle", or any unrelated placeholder topic
 - Use loremflickr.com for ALL images: https://loremflickr.com/{width}/{height}/{keyword1},{keyword2}?lock={n}
   Keywords MUST relate to the theme topic (e.g. battery,energy for a battery store). Use different ?lock=N per item.
 
-${DESIGN_SYSTEM}
-${WP_SECURITY_RULES}
-${existingContext}
+${designSystemForBatch}
+${cssVarsBlock}${existingContext}
 Generate ONLY these files (batch ${batchIdx + 1}/${batches.length}):
 ${fileList}
 
@@ -5271,47 +5376,92 @@ CRITICAL rules (violating these causes errors):
 - This is a WordPress theme — ALL template files must be PHP
 - style.css MUST start with the WordPress theme header comment (/* Theme Name: "${ctx.analysis?.brandName ?? ctx.analysis?.projectName}" */)
 - functions.php MUST start with <?php and use WordPress hooks properly
-- ALWAYS check if ( ! defined( 'ABSPATH' ) ) { exit; } at the top of PHP files
+- functions.php MUST require_once BOTH: require_once get_template_directory() . '/inc/theme-data.php'; AND require_once get_template_directory() . '/inc/customizer.php';
+- ALWAYS check if ( ! defined( 'ABSPATH' ) ) { exit; } at the top of every PHP file EXCEPT index.php and front-page.php
 - Use proper WordPress escaping: esc_html(), esc_attr(), esc_url(), wp_kses_post() — escape at the point of output
 - Use i18n functions: __(), _e(), esc_html__(), esc_html_e() with the theme text domain
+- Sanitize inputs: sanitize_text_field(wp_unslash($input)), absint(), sanitize_email() — sanitize on input, escape on output
+- Any form with side effects must include wp_nonce_field() and verify with wp_verify_nonce() + current_user_can() server-side
+- Never interpolate user input into SQL — always use $wpdb->prepare()
 - Use get_template_part() to include template parts, NOT include/require
 - Use wp_enqueue_style/script() in functions.php — do NOT add <link>/<script> tags directly
 - header.php must include wp_head() before </head> and wp_body_open() after <body>
 - header.php must have <a class="skip-to-content" href="#main-content">Skip to content</a> as first body element
 - footer.php must include wp_footer() before </body>
+- front-page.php MUST call get_template_part() for sections in THIS EXACT ORDER:
+    hero → featured-products → categories → editorial → archives-gallery → about → back-to-top
+  Do NOT skip any section, do NOT change the order.
 - Use register_nav_menus() for navigation, wp_nav_menu() to display — do NOT create custom Walker classes
+- NAV CONTRACT: if functions.php registers a menu location 'primary', header.php MUST render wp_nav_menu() with theme_location => 'primary'.
+  Never register 'primary' and render 'menu-primary' or any other mismatched slug.
+- PREVIEW-SAFE NAV: header.php must provide a non-empty fallback menu when no WordPress menu is assigned so the local PHP router preview still renders the intended layout.
 - Use get_theme_mod() for Customizer settings
 - inc/theme-data.php MUST define EXACTLY these 5 functions (no more, no fewer):
-    {prefix}_get_site_config(), {prefix}_get_products(), {prefix}_get_categories(), {prefix}_get_articles(), {prefix}_get_gallery()
+    ${actualPrefix}_get_site_config(), ${actualPrefix}_get_products(), ${actualPrefix}_get_categories(), ${actualPrefix}_get_articles(), ${actualPrefix}_get_gallery()
   Template parts may ONLY call those 5 functions — do NOT invent extra functions like get_hero_data(), get_features(), get_stats()
+- DATA CONTRACT SOURCE OF TRUTH: inc/theme-data.php is the only source of truth for array shapes.
+  If a template needs keys like slug, specs, date_iso, location, author.avatar, or CTA URLs, define those keys in the corresponding data function FIRST and then use those exact keys in the template.
+  Never assume derived aliases exist unless you explicitly define them in inc/theme-data.php in the same response.
 - CSS should use BEM naming (.section-hero, .section-hero__title, .section-hero--large)
 - CSS must use CSS custom properties (var(--color-primary)) for theming
-- All animations/transitions must be wrapped in @media (prefers-reduced-motion: no-preference) { }
-- All :hover effects must also have equivalent :focus-visible styles for keyboard accessibility
+- CSS CLASS SYNC: Every CSS class written in style.css MUST exactly match the class attribute used in the PHP template for the same element. Never define a class like .categories-grid if the PHP uses class="section-categories__grid". Write both the HTML and CSS in the same pass and verify they match before returning.
+- JS SELECTOR SYNC: Every selector used in assets/js/main.js MUST match markup that actually exists in the generated PHP.
+  Never query .mobile-menu-toggle, #mobile-nav, or other selectors unless header/footer/templates render those exact classes or ids.
+- FIXED HEADER OFFSET: If .site-header uses position: fixed, the body element MUST have padding-top equal to the header height (e.g. body { padding-top: 80px; }). The first section (hero) MUST NOT have its own padding-top to compensate — set it on body. This prevents the header from overlapping page content.
+- CSS SECTIONS MUST COVER TEMPLATE CLASSES: Every BEM class used in a template-part PHP file must have a corresponding CSS rule in style.css. Do NOT define CSS for a generic class (.categories-grid) if the template uses a specific BEM class (.section-categories__grid). Generate CSS that matches exactly the classes in the HTML output.
+- CSS VARIABLE DISCIPLINE: ONLY use var(--X) for properties explicitly declared in the :root block of style.css.
+  Never reference an undefined variable. If you need a variant, define it in :root (e.g. --color-primary-dark: #0284c7).
+- CSS LAYOUT: Every flex/grid container must have min-width: 0 on children with text/images to prevent overflow.
+  Use overflow: hidden on image wrappers.
+- CSS IMAGES: All <img> and image-wrapper elements must have a defined height (px or aspect-ratio) and object-fit: cover.
+- CSS COLORS: Never use bare hex/rgb literals for text or backgrounds — always use a CSS custom property from :root.
+  Text on colored backgrounds MUST use the -foreground token (e.g. color: var(--color-primary-foreground) on primary bg).
+- TRANSITIONS: transition properties must ONLY appear inside @media (prefers-reduced-motion: no-preference) { } blocks.
+  Do NOT put transition: ... on a bare selector outside this media query.
+- All :hover effects must have equivalent :focus-visible styles for keyboard accessibility
 - Every <img> must have a descriptive alt="" attribute
 - Semantic HTML: use <main id="main-content">, <nav aria-label>, <header role="banner">, <footer role="contentinfo">
 - No React, No JSX, No TypeScript, No Tailwind, No Next.js
 - For images: use <img> tags or inline style="background-image: url('...')" with loremflickr.com URLs — always use keywords matching the theme topic
 - Every file must be COMPLETE — no TODOs, no placeholders, no "..." shortcuts
-- Do NOT use WooCommerce APIs, WooCommerce functions, WC(), wc_get_cart_url(), cart, checkout, or plugin-dependent code unless the user's idea explicitly requests WooCommerce.
-- Generated themes must run in a plain local PHP preview/router without any WordPress plugins active.
-- NEVER call WC()->cart directly.
-- If WooCommerce support is explicitly required, always guard it:
+- DATA KEY DISCIPLINE: Before writing any template part, read the exact array structure returned by each data function in inc/theme-data.php (in the "Already generated files" context above).
+  Access ONLY keys that are explicitly defined in those return arrays (e.g. if get_products() returns ['name','price','image','specs'], do NOT access $p['specifications'] or $p['description']).
+  When inc/theme-data.php is not yet available (batch 0), define the data structure first in theme-data.php and match it exactly in templates.
+- SECTION ANCHORS: if navigation or CTA links point to #featured-products, #categories, #editorial, #archives, or #about, the corresponding section markup MUST include that exact id attribute.
+
+WOOCOMMERCE RULES (default OFF):
+- Do NOT use WooCommerce APIs, WC(), wc_get_cart_url(), cart, checkout unless the user's idea explicitly requests WooCommerce.
+- Generated themes must run in a plain local PHP preview/router without any WordPress plugins.
+- NEVER call WC()->cart directly. If WooCommerce is explicitly required, guard every call:
   function_exists('WC') && WC() && isset(WC()->cart) && is_object(WC()->cart)
-- If WooCommerce is unavailable, hide cart/checkout UI instead of throwing errors.
-- Return ONLY the ${batch.length} file(s) listed above`;
+
+⚠️  SELF-CHECK before returning JSON — verify ALL of the following:
+1. Every var(--X) used in CSS is explicitly defined in :root of style.css.
+2. No transition: property exists outside a @media (prefers-reduced-motion: no-preference) block.
+3. Every function called in template-parts is one of the 5 defined in inc/theme-data.php (prefix: ${actualPrefix}_).
+4. functions.php has require_once for both inc/theme-data.php and inc/customizer.php.
+5. No TODO, no "...", no placeholder text remains in any file.
+6. front-page.php calls all 7 template-parts in the correct order.
+7. Every $item['key'] accessed in template parts matches a key actually present in the arrays returned by the data functions in inc/theme-data.php.
+8. Every CSS class in style.css exactly matches the class attribute in the corresponding PHP HTML — no mismatches like .categories-grid vs class="section-categories__grid".
+9. If .site-header uses position: fixed, body has padding-top set to the header height so no section is hidden behind the header.
+10. header.php uses the same registered menu location slug as functions.php, and the fallback menu is not empty in router preview.
+11. Every selector referenced in assets/js/main.js exists in the generated HTML.
+12. Every in-page anchor target used by nav/CTA links exists as a real id on the page.
+
+Return ONLY the ${batch.length} file(s) listed above`;
 
       log("INFO", `Batch ${batchIdx + 1}/${batches.length}: generating ${batch.map((f) => f.filePath).join(", ")}`);
 
-      let batchFiles: GeneratedFile[];
+      const batchMaxTokens = batchHasCss ? 32000 : 16384;
+
       try {
-        batchFiles = (await callLLM(prompt, 32000)) as GeneratedFile[];
+        return (await callLLM(prompt, batchMaxTokens)) as GeneratedFile[];
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("truncated") && batch.length > 1) {
-          // Truncation: retry files one-by-one
           log("WARN", `Batch ${batchIdx + 1} truncated — retrying ${batch.length} files individually`);
-          batchFiles = [];
+          const retried: GeneratedFile[] = [];
           for (const singleFile of batch) {
             const singlePrompt = prompt
               .replace(/Generate ONLY these files \(batch .*?\):\n[\s\S]*?\nRespond/,
@@ -5322,36 +5472,64 @@ CRITICAL rules (violating these causes errors):
             try {
               const singleResult = (await callLLM(singlePrompt, 16384)) as GeneratedFile[] | GeneratedFile;
               const files = Array.isArray(singleResult) ? singleResult : [singleResult];
-              batchFiles.push(...files);
-              allFiles.push(...files);
+              retried.push(...files);
             } catch (singleErr: unknown) {
               const singleMsg = singleErr instanceof Error ? singleErr.message : String(singleErr);
               log("ERROR", `  Failed to generate ${singleFile.filePath}: ${singleMsg}`);
             }
-            await sleep(5000);
+            await sleep(1_000);
           }
-          log("INFO", `Batch ${batchIdx + 1} done (individual mode): ${batchFiles.length} files received`);
-          continue;
+          log("INFO", `Batch ${batchIdx + 1} done (individual mode): ${retried.length} files received`);
+          return retried;
         }
-        throw err; // Re-throw non-truncation errors
+        throw err;
       }
-      allFiles.push(...batchFiles);
+    };
 
-      log("INFO", `Batch ${batchIdx + 1} done: ${batchFiles.length} files received`);
+    /** Run an array of async task factories with at most `concurrency` running at once. */
+    const pooledAll = async <T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<T[]> => {
+      const results: T[] = new Array(tasks.length);
+      let nextIdx = 0;
+      const worker = async () => {
+        while (nextIdx < tasks.length) {
+          const idx = nextIdx++;
+          results[idx] = await tasks[idx]();
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+      return results;
+    };
 
-      // Rate limit cooldown between batches
-      if (batchIdx < batches.length - 1) {
-        log("DEBUG", "Waiting 10s between batches (rate limit cooldown)…");
-        await sleep(10_000);
+    // Batch 0 always runs first (style.css + functions.php) so subsequent batches can reference CSS vars.
+    const allFiles: GeneratedFile[] = [];
+    const batch0Files = await runBatch(0, batches[0], []);
+    allFiles.push(...batch0Files);
+    log("INFO", `Batch 1 done: ${batch0Files.length} files received`);
+
+    if (batches.length > 1) {
+      // Short cooldown after batch 0 before firing parallel PHP batches
+      await sleep(2_000);
+
+      // PHP-only batches (1+) share batch 0 results as context and run with concurrency=2
+      const phpBatchTasks = batches.slice(1).map((batch, i) => async () => {
+        const batchIdx = i + 1;
+        // Small stagger to reduce simultaneous rate-limit pressure
+        if (i > 0) await sleep(500 * i);
+        const files = await runBatch(batchIdx, batch, [...allFiles]);
+        log("INFO", `Batch ${batchIdx + 1} done: ${files.length} files received`);
+        return files;
+      });
+
+      const phpBatchResults = await pooledAll(phpBatchTasks, 2);
+      for (const files of phpBatchResults) {
+        allFiles.push(...files);
       }
     }
 
     ctx.generatedFiles = allFiles;
 
     await fs.mkdir(ctx.workspacePath, { recursive: true });
-    for (const f of allFiles) {
-      await writeFileSafe(ctx.workspacePath, f.filePath, f.content);
-    }
+    await Promise.all(allFiles.map((f) => writeFileSafe(ctx.workspacePath, f.filePath, f.content)));
 
     log("INFO", `Code generated: ${allFiles.length} files written to ${ctx.workspacePath}`);
     return { success: true, data: allFiles };
@@ -5798,8 +5976,14 @@ async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>
     let allValid = true;
     let lintOutput = "";
 
-    for (const phpFile of phpFiles) {
-      const result = execSafe(`php -l "${phpFile}"`, ws);
+    const lintResults = await Promise.all(
+      phpFiles.map(async (phpFile) => {
+        const result = await execSafeAsync(`php -l "${phpFile}"`, ws);
+        return { phpFile, result };
+      })
+    );
+
+    for (const { phpFile, result } of lintResults) {
       lintOutput += `${phpFile}: ${result.stdout}\n`;
       if (!result.success) {
         allValid = false;
@@ -5873,6 +6057,7 @@ Common causes:
 
 RULES:
 - Fix the root cause, don't just suppress errors
+- DATA KEY FIX: If the error is "Cannot access offset of type string on string" or "Undefined array key", open inc/theme-data.php in the source files above and check the EXACT keys returned by each data function. Fix the template to use only those exact keys.
 - Ensure all template parts are properly included via get_template_part()
 - Ensure all data functions are defined in inc/theme-data.php and loaded via functions.php
 - Use proper WordPress escaping
@@ -5886,16 +6071,14 @@ Respond with JSON:
   "explanation": "What was wrong and how it was fixed"
 }`;
 
-        const rtFix = (await callLLM(rtFixPrompt)) as BuildFixResponse;
+        const rtFix = (await callLLM(rtFixPrompt, 32000)) as BuildFixResponse;
         log("INFO", `Runtime fix: ${rtFix.explanation}`);
 
-        for (const f of rtFix.fixes) {
-          await writeFileSafe(ws, f.filePath, f.content);
-        }
+        await Promise.all(rtFix.fixes.map((f) => writeFileSafe(ws, f.filePath, f.content)));
 
         if (rtAttempt < RUNTIME_MAX_RETRIES) {
-          log("INFO", "Waiting 10s before next runtime check…");
-          await sleep(10_000);
+          log("INFO", "Waiting 3s before next runtime check…");
+          await sleep(3_000);
         }
       }
 
@@ -5915,13 +6098,26 @@ Respond with JSON:
     // Ask LLM to fix PHP errors
     log("INFO", "Requesting PHP fix from LLM…");
 
+    // Only send files that have syntax errors + always-include anchor files.
+    // This avoids burning tokens on files that are already correct.
+    const brokenFileNames = new Set<string>();
+    for (const line of lintOutput.split("\n")) {
+      const m = line.match(/^([^\s:]+\.php)/);
+      if (m) brokenFileNames.add(m[1]);
+    }
+    const alwaysInclude = ["functions.php", "inc/theme-data.php"];
     const sourceFiles: { path: string; content: string }[] = [];
-
     for (const fp of allFiles) {
-      if (fp.endsWith(".php") || fp.endsWith(".css") || fp.endsWith(".js")) {
+      if (!fp.endsWith(".php")) continue;
+      const isBroken = [...brokenFileNames].some(
+        (bf) => fp.includes(path.basename(bf)) || bf.includes(path.basename(fp))
+      );
+      const isAlways = alwaysInclude.some((a) => fp.endsWith(a));
+      if (isBroken || isAlways) {
         sourceFiles.push({ path: fp, content: await readFileSafe(ws, fp) });
       }
     }
+    log("DEBUG", `[FIX_BUILD] sending ${sourceFiles.length} file(s) to LLM (out of ${allFiles.length} total)`);
 
     const fixPrompt = `[FIX_BUILD]
 The following WordPress theme has PHP syntax errors. Analyze and provide fixed file contents.
@@ -5929,7 +6125,7 @@ The following WordPress theme has PHP syntax errors. Analyze and provide fixed f
 PHP lint output:
 ${lintOutput}
 
-Project files:
+Files with errors (plus key anchor files):
 ${JSON.stringify(sourceFiles, null, 2)}
 
 Respond with JSON:
@@ -5940,16 +6136,14 @@ Respond with JSON:
   "explanation": "What was wrong and how it was fixed"
 }`;
 
-    const fix = (await callLLM(fixPrompt)) as BuildFixResponse;
+    const fix = (await callLLM(fixPrompt, 32000)) as BuildFixResponse;
     log("INFO", `LLM fix: ${fix.explanation}`);
 
-    for (const f of fix.fixes) {
-      await writeFileSafe(ws, f.filePath, f.content);
-    }
+    await Promise.all(fix.fixes.map((f) => writeFileSafe(ws, f.filePath, f.content)));
 
     if (attempt < MAX_RETRIES) {
-      log("INFO", "Waiting 15s before next lint attempt (rate limit cooldown)…");
-      await sleep(15_000);
+      log("INFO", "Waiting 3s before next lint attempt…");
+      await sleep(3_000);
     }
   }
 
@@ -6475,7 +6669,7 @@ COMMON FIXES:
 - "Call to undefined function X()" → function not included or misspelled
 - "Cannot redeclare function X()" → file loaded twice, use require_once instead of require
 - "Argument #1 must be of type int|float, string given" for number_format() → cast with (float) or use intval()
-- "Undefined array key" → use isset() or ?? default
+- "Undefined array key" / "Cannot access offset of type string on string" → template accesses a key that doesn't exist in the data function return. Open inc/theme-data.php in SOURCE FILES above, find the relevant function, read its EXACT return array keys, then fix the template to use only those keys.
 - Missing data field → check inc/theme-data.php for correct field names, fix callers to match
 
 Return JSON:
@@ -6493,7 +6687,7 @@ RULES:
 - Ensure data keys in templates match the keys defined in inc/theme-data.php`;
 
     try {
-      const fix = (await callLLM(fixPrompt)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
+      const fix = (await callLLM(fixPrompt, 32000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
       if (fix.files && Array.isArray(fix.files)) {
         for (const f of fix.files) {
           const filePath = path.join(ctx.workspacePath, f.path);
@@ -6993,9 +7187,9 @@ ${(rtResult.serverOutput ?? "").slice(-3000)}
 SOURCE FILES:
 ${fileContents.join("\n\n")}
 
-COMMON PHP RUNTIME ERROR PATTERNS:
-- "Call to undefined function" → function not defined or file not included via require_once
-- "Undefined array key" → accessing array key that doesn't exist, use isset() or ??
+COMMON FIXES:
+- "Call to undefined function X()" → function not defined or file not included via require_once
+- "Undefined array key" / "Cannot access offset of type string on string" → template is accessing a key that doesn't exist in the data function's return array. CHECK inc/theme-data.php for the exact array keys and fix the template to match.
 - "Undefined variable" → variable not initialized, check scope
 - Missing ABSPATH check → add if ( ! defined( 'ABSPATH' ) ) { exit; }
 - Wrong include path → use get_template_part() for template-parts/, require_once for inc/
@@ -7015,7 +7209,7 @@ RULES:
 - Return COMPLETE file contents, not patches`;
 
         try {
-          const rtFix = (await callLLM(fixPrompt)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
+          const rtFix = (await callLLM(fixPrompt, 32000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
           if (rtFix.files && Array.isArray(rtFix.files)) {
             for (const f of rtFix.files) {
               const filePath = path.join(ctx.workspacePath, f.path);
