@@ -18,13 +18,56 @@
  *   OUTPUT_DIR         – Root for generated projects (default: ./output)
  */
 
-import "dotenv/config";
+import * as dotenv from "dotenv";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import { Dirent, existsSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { execSync, spawn, exec, ChildProcess } from "node:child_process";
+
+const APP_ENV_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_MODEL", "LOG_LEVEL", "AUTO_APPROVE", "OUTPUT_DIR"] as const;
+let loadedDotenvValues: Partial<Record<(typeof APP_ENV_KEYS)[number], string>> = {};
+
+function loadAppEnv(): void {
+  const shellValues = new Map<string, string>();
+  for (const key of APP_ENV_KEYS) {
+    const value = process.env[key];
+    if (typeof value === "string") shellValues.set(key, value);
+  }
+
+  const result = dotenv.config();
+  if (!result.parsed) return;
+  loadedDotenvValues = result.parsed;
+
+  for (const key of APP_ENV_KEYS) {
+    const dotenvValue = result.parsed[key];
+    if (typeof dotenvValue !== "string") continue;
+
+    const shellValue = shellValues.get(key);
+    if (
+      key === "ANTHROPIC_API_KEY"
+      && process.env.FORCE_MOCK_MODE !== "true"
+      && dotenvValue.trim()
+    ) {
+      if (typeof shellValue === "string" && shellValue !== dotenvValue) {
+        console.warn(`[config] using .env value for ${key}; ignoring differing shell value`);
+      }
+      process.env[key] = dotenvValue;
+      continue;
+    }
+
+    if (typeof shellValue === "string" && shellValue !== dotenvValue) {
+      console.warn(`[config] keeping shell value for ${key}; ignoring differing .env value`);
+      process.env[key] = shellValue;
+      continue;
+    }
+
+    process.env[key] = dotenvValue;
+  }
+}
+
+loadAppEnv();
 
 // ═════════════════════════════════════════════════════════════════════════════
 //  TYPES
@@ -62,7 +105,10 @@ interface NonFunctionalRequirements {
   seo: string[];
 }
 
+type ProjectType = "wordpress_theme" | "wordpress_plugin";
+
 interface FeatureAnalysis {
+  projectType: ProjectType;
   projectName: string;
   brandName: string;
   summary: string;
@@ -88,6 +134,7 @@ interface ApiEndpoint {
 }
 
 interface ProjectSpec {
+  projectType: ProjectType;
   architecture: string;
   fileStructure: FileSpec[];
   apiEndpoints: ApiEndpoint[];
@@ -200,6 +247,160 @@ async function writeFileSafe(ws: string, fp: string, content: string): Promise<v
   log("DEBUG", `Wrote ${fp} (${content.length} bytes)`);
 }
 
+const UPLOAD_PACKAGE_EXCLUDES = new Set([
+  ".agent-artifacts",
+  ".agent-checkpoint.json",
+  ".DS_Store",
+  ".git",
+  ".gitignore",
+  ".router.php",
+  "IDEA.md",
+  "SPEC.md",
+]);
+
+function inferProjectType(value: string): ProjectType {
+  return /(plugin|extension|addon|add-on|module|tiện ích|phần mở rộng)/i.test(value)
+    ? "wordpress_plugin"
+    : "wordpress_theme";
+}
+
+function isThemeProject(analysis: FeatureAnalysis | null): boolean {
+  return (analysis?.projectType ?? "wordpress_theme") === "wordpress_theme";
+}
+
+function getProjectTypeLabel(projectType: ProjectType): string {
+  return projectType === "wordpress_plugin" ? "WordPress plugin" : "WordPress theme";
+}
+
+function slugifyPackageName(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "wordpress-package";
+}
+
+function getPluginMainFileFromSpec(spec: ProjectSpec, projectSlug?: string): string {
+  const slug = slugifyPackageName(projectSlug ?? "wordpress-plugin");
+  const preferred = spec.fileStructure.find((file) => file.filePath === `${slug}.php`);
+  if (preferred) {
+    return preferred.filePath;
+  }
+
+  const rootPhp = spec.fileStructure.find(
+    (file) => file.filePath.endsWith(".php") && !file.filePath.includes("/") && file.filePath !== "uninstall.php"
+  );
+
+  return rootPhp?.filePath ?? `${slug}.php`;
+}
+
+async function findPluginEntryFile(projectDir: string, preferredSlug?: string): Promise<string | null> {
+  const rootEntries = await fs.readdir(projectDir, { withFileTypes: true });
+  const rootPhp = rootEntries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".php") && entry.name !== "uninstall.php")
+    .map((entry) => entry.name);
+
+  if (preferredSlug) {
+    const preferredFile = `${preferredSlug}.php`;
+    if (rootPhp.includes(preferredFile)) {
+      return preferredFile;
+    }
+  }
+
+  for (const fileName of rootPhp) {
+    try {
+      const content = await fs.readFile(path.join(projectDir, fileName), "utf-8");
+      if (/^\s*\/\*[\s\S]*?Plugin Name:/m.test(content)) {
+        return fileName;
+      }
+    } catch {
+      // Ignore unreadable candidates and continue scanning.
+    }
+  }
+
+  return rootPhp[0] ?? null;
+}
+
+async function getUploadPackageSlug(projectDir: string, analysis: FeatureAnalysis | null): Promise<string> {
+  const fallback = slugifyPackageName(analysis?.projectName ?? path.basename(projectDir));
+
+  if (isThemeProject(analysis)) {
+    try {
+      const styleCss = await fs.readFile(path.join(projectDir, "style.css"), "utf-8");
+      const match = styleCss.match(/^Theme Name:\s*(.+)$/m);
+      return slugifyPackageName(match?.[1]?.trim() || fallback);
+    } catch {
+      return fallback;
+    }
+  }
+
+  const entryFile = await findPluginEntryFile(projectDir, analysis?.projectName);
+  if (!entryFile) {
+    return fallback;
+  }
+
+  try {
+    const pluginPhp = await fs.readFile(path.join(projectDir, entryFile), "utf-8");
+    const match = pluginPhp.match(/^\s*Plugin Name:\s*(.+)$/m);
+    return slugifyPackageName(match?.[1]?.trim() || path.basename(entryFile, ".php") || fallback);
+  } catch {
+    return slugifyPackageName(path.basename(entryFile, ".php") || fallback);
+  }
+}
+
+async function createUploadReadyPackageZip(projectDir: string, analysis: FeatureAnalysis | null): Promise<string> {
+  const packageSlug = await getUploadPackageSlug(projectDir, analysis);
+  const projectType = analysis?.projectType ?? inferProjectType(path.basename(projectDir));
+  const parentDir = path.dirname(projectDir);
+  const stagingRoot = path.join(parentDir, `.${packageSlug}-package`);
+  const stagingPackageDir = path.join(stagingRoot, packageSlug);
+  const zipPath = path.join(parentDir, `${packageSlug}.zip`);
+  const pluginEntryFile = projectType === "wordpress_plugin"
+    ? await findPluginEntryFile(projectDir, analysis?.projectName)
+    : null;
+  const requiredFiles = projectType === "wordpress_theme"
+    ? ["style.css", "functions.php", "index.php"]
+    : [pluginEntryFile].filter((value): value is string => Boolean(value));
+
+  for (const requiredFile of requiredFiles) {
+    if (!existsSync(path.join(projectDir, requiredFile))) {
+      throw new Error(`Cannot create upload package: missing ${requiredFile}`);
+    }
+  }
+
+  if (projectType === "wordpress_plugin" && !pluginEntryFile) {
+    throw new Error("Cannot create upload package: missing root plugin bootstrap file");
+  }
+
+  await fs.rm(stagingRoot, { recursive: true, force: true });
+  await fs.rm(zipPath, { force: true });
+  await fs.mkdir(stagingPackageDir, { recursive: true });
+
+  const entries = await fs.readdir(projectDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (UPLOAD_PACKAGE_EXCLUDES.has(entry.name) || entry.name.endsWith(".zip")) {
+      continue;
+    }
+
+    const src = path.join(projectDir, entry.name);
+    const dest = path.join(stagingPackageDir, entry.name);
+    await fs.cp(src, dest, {
+      recursive: true,
+      filter: (sourcePath) => path.basename(sourcePath) !== ".DS_Store",
+    });
+  }
+
+  const zipResult = execSafe(`zip -rq "${zipPath}" "${packageSlug}"`, stagingRoot, 120_000);
+  await fs.rm(stagingRoot, { recursive: true, force: true });
+
+  if (!zipResult.success || !existsSync(zipPath)) {
+    throw new Error(`Failed to create upload zip: ${zipResult.stdout || "zip command failed"}`);
+  }
+
+  return zipPath;
+}
+
 async function readFileSafe(ws: string, fp: string): Promise<string> {
   return fs.readFile(resolveSafe(ws, fp), "utf-8");
 }
@@ -279,8 +480,9 @@ Design a visually stunning, modern landing page theme.
 Be creative with layout, animations, and visual hierarchy — but follow these technical rules:
 
 ### Font
-- Use Google Font "Inter" loaded via wp_enqueue_style in functions.php
-- Font weights: 400 (body), 500 (medium), 600 (semibold), 700 (bold), 800 (extrabold), 900 (black)
+- Choose an intentional Google Fonts pairing that matches the brand topic.
+- Use one expressive display font for headings and one clean UI/body font for supporting text.
+- Avoid default-safe combinations like Inter-only unless the user's brief explicitly asks for a neutral SaaS aesthetic.
 - Apply font-smoothing: antialiased
 
 ### Color Palette (define as CSS custom properties in style.css :root)
@@ -307,7 +509,10 @@ Choose a cohesive color palette that matches the user's topic. Include:
 - Media queries for responsive: mobile-first approach
 - Image wrappers must have overflow: hidden; images must have height + object-fit: cover to prevent layout shift
 - ⚠️  FIXED HEADER OFFSET: If .site-header uses position: fixed or position: sticky, body MUST have padding-top equal to the header height (e.g. \`body { padding-top: var(--header-height, 80px); }\`). Add \`--header-height: 80px\` to :root.
+- ⚠️  WORDPRESS ADMIN BAR: Logged-in WordPress previews include #wpadminbar. If the header is fixed, offset .site-header and body padding correctly for .admin-bar so the top of the page does not show a blank strip or clipped header.
 - ⚠️  CSS–PHP CLASS SYNC: Every CSS selector you write (.section-about__stats-cards, .section-categories__grid, etc.) MUST exactly match the \`class="..."\` attribute used in the corresponding PHP template. Do NOT define \`.categories-grid\` if the PHP template uses \`class="section-categories__grid"\`. Write CSS classes to match PHP, or write PHP to match CSS — but they MUST be identical.
+- ⚠️  ABOVE-THE-FOLD DISCIPLINE: Do not build a hero that needs an entire extra screen to reveal the CTA. The hero must show headline, supporting copy, primary CTA, and at least one trust signal within the first viewport on desktop and mobile.
+- ⚠️  SECTION RHYTHM: Avoid oversized empty gaps between sections. Section spacing should feel deliberate and compact enough that the next section heading starts near the fold after the hero.
 
 ### CSS Reset & Base (in style.css after theme header)
 \`\`\`css
@@ -316,7 +521,7 @@ Choose a cohesive color palette that matches the user's topic. Include:
 body {
   background-color: var(--color-background, #ffffff);
   color: var(--color-foreground, #0f172a);
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-family: var(--font-body, system-ui, -apple-system, sans-serif);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   line-height: 1.6;
@@ -400,24 +605,25 @@ a { text-decoration: none; color: inherit; }
 8. **Form labels**: Every form input must have an associated <label> or aria-label attribute
 
 ### Design Principles
-1. **Spacing**: Use generous padding (section padding: 4rem 0; @media(min-width:768px) { 6rem 0; })
+1. **Spacing**: Use confident but controlled padding. Avoid giant vertical gaps. Default section rhythm should usually stay within 3rem–5rem.
 2. **Container**: Use .container class (max-width: 1280px, centered)
 3. **Responsive**: Mobile-first CSS, grid layouts that stack on mobile
-4. **Images**: Use loremflickr.com URLs for topic-relevant placeholder images — keywords MUST match the theme/product topic
-   - Format: https://loremflickr.com/{width}/{height}/{keyword1},{keyword2}?lock={n}
-   - Use different ?lock=N (1, 2, 3 ...) per item so each image is unique but consistent on reload
-   - Hero: 1920x1080, Products: 600x800, Categories: 800x600, Editorial: 800x600, Gallery: 800x600, About: 800x800
-   - Choose 1-2 keywords from the theme topic (e.g. battery,energy for batteries; fashion,clothing for apparel)
+4. **Imagery**: Do NOT use loremflickr, picsum, placehold, or any remote placeholder-photo service.
+  - Prefer CSS gradients, layered shapes, glass panels, iconography, and local SVG artwork to create atmosphere.
+  - If the layout needs illustrative assets, generate small local SVG files under assets/images/ and reference those files from PHP/CSS.
+  - Hero visuals should feel intentional: a split composition, framed product shot, or abstract brand illustration is better than a random full-bleed stock photo.
 5. **Hover effects**: transform: scale(1.05), box-shadow transitions, opacity changes — but only inside @media (prefers-reduced-motion: no-preference)
 6. **Shadows**: Use box-shadow for depth hierarchy (sm, md, xl variants)
 7. **Rounded corners**: border-radius for cards, featured items, avatars/buttons
 8. **Transitions**: transition: all 0.3s ease for smooth interactions — wrap in prefers-reduced-motion
 9. **Typography scale**: Use rem units with a clear size scale
 10. **Dark overlays on images**: Use pseudo-elements or gradient overlays for text readability
+11. **Avoid AI-slop defaults**: No generic SaaS hero, no purple-on-white default palette, no full-page stock-photo dependency, no oversized glassmorphism everywhere.
+12. **Mobile behavior**: On mobile, CTA buttons must remain visible without overlap, floating badges/cards must reflow or hide, and section headings should not be pushed far below the fold.
 
 ### Page Sections (create each as a template-part)
 1. **Header** — Sticky nav with glass effect, logo, wp_nav_menu, CTA button (header.php)
-2. **Hero** — Full-width hero with background image, bold headline, subtitle, CTA (template-parts/hero.php)
+2. **Hero** — Split-layout hero with an anchored visual panel or illustration, bold headline, subtitle, CTA, and trust signals. Do not default to a full-viewport background-photo hero. (template-parts/hero.php)
 3. **FeaturedProducts** — Product/item cards grid (4 cols desktop) with hover effects (template-parts/featured-products.php)
 4. **Categories** — Visual category cards with overlay text (template-parts/categories.php)
 5. **Editorial** — Featured article + article grid magazine layout (template-parts/editorial.php)
@@ -427,7 +633,7 @@ a { text-decoration: none; color: inherit; }
 9. **BackToTop** — Fixed bottom-right floating button (template-parts/back-to-top.php)
 `;
 
-const REQUIRED_FILE_STRUCTURE = `
+const REQUIRED_THEME_FILE_STRUCTURE = `
 ### Required File Structure (use EXACTLY these paths)
 - style.css (WordPress theme header comment + base styles + all component styles)
 - functions.php (Theme setup: enqueue styles/scripts, register menus, add_theme_support, Customizer settings)
@@ -451,6 +657,27 @@ const REQUIRED_FILE_STRUCTURE = `
 - template-parts/back-to-top.php (Back to top floating button)
 `;
 
+const REQUIRED_PLUGIN_FILE_STRUCTURE = `
+### Required File Structure (use EXACTLY these paths)
+- {plugin-slug}.php (Main plugin bootstrap with header comment, constants, activation/deactivation hooks)
+- uninstall.php (Cleanup logic for uninstall)
+- readme.txt (Plugin installation and usage summary)
+- assets/css/admin.css (Admin styles)
+- assets/css/public.css (Frontend styles)
+- assets/js/admin.js (Admin interactions)
+- assets/js/public.js (Frontend interactions)
+- admin/class-admin.php (Admin menu, settings registration, asset loading)
+- public/class-public.php (Frontend hooks and asset loading)
+- includes/class-loader.php (Central hook/action loader)
+- includes/class-plugin.php (Main plugin coordinator)
+- includes/class-api.php (REST/integration or feature service layer)
+- includes/class-security.php (Sanitization, nonce, capability helpers)
+- includes/class-activator.php (Activation tasks)
+- includes/class-deactivator.php (Deactivation tasks)
+- languages/index.php (Language directory placeholder)
+- templates/settings-page.php (Admin settings UI template)
+`;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  DESIGN_SYSTEM_PHP — Compact reference for PHP-only batches (no CSS code examples)
 //  Injected in place of the full DESIGN_SYSTEM when the batch has no .css file.
@@ -459,7 +686,7 @@ const REQUIRED_FILE_STRUCTURE = `
 const DESIGN_SYSTEM_PHP = `
 ### Design Reference (PHP files — consult style.css for full CSS rules)
 
-**Fonts**: 'Inter' (body), 'Playfair Display' (display headings)
+**Fonts**: Use one expressive display font plus one clean body font, both declared as CSS variables. Avoid Inter-only defaults unless explicitly requested.
 
 **Available CSS tokens** (always use var(--X), never bare hex):
 - Colors: --color-primary, --color-primary-foreground, --color-secondary, --color-secondary-foreground,
@@ -471,8 +698,8 @@ const DESIGN_SYSTEM_PHP = `
 - Radius: --radius-sm, --radius-md, --radius-lg, --radius-full
 - Shadow: --shadow-sm, --shadow-md, --shadow-lg, --shadow-xl, --shadow-2xl
 
-**Design principles**: Premium, modern aesthetic. Glass morphism on nav. Bold hero. BEM CSS naming.
-All images via loremflickr.com with topic-relevant keywords. Semantic HTML5 landmarks.
+**Design principles**: Premium, modern aesthetic. Intentional visual hierarchy. Bold but compact hero. BEM CSS naming.
+Prefer local SVG artwork, gradients, and shaped surfaces over remote placeholder photography. Semantic HTML5 landmarks.
 `;
 
 
@@ -534,16 +761,89 @@ function gitCommit(
 //  LLM WRAPPER (Claude API — falls back to mock when no key)
 // ═════════════════════════════════════════════════════════════════════════════
 
-const USE_MOCK = !process.env.ANTHROPIC_API_KEY;
+const USE_MOCK = process.env.FORCE_MOCK_MODE === "true" || !process.env.ANTHROPIC_API_KEY;
+let preferredAnthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim() || "";
+
+function getAnthropicApiKeyCandidates(): string[] {
+  const candidates = new Set<string>();
+  const currentKey = preferredAnthropicApiKey || process.env.ANTHROPIC_API_KEY?.trim() || "";
+  const dotenvKey = loadedDotenvValues.ANTHROPIC_API_KEY?.trim();
+
+  if (currentKey) {
+    candidates.add(currentKey);
+  }
+
+  if (
+    process.env.FORCE_MOCK_MODE !== "true"
+    && dotenvKey
+    && dotenvKey !== currentKey
+  ) {
+    candidates.add(dotenvKey);
+  }
+
+  return [...candidates];
+}
+
+function promoteWorkingAnthropicApiKey(apiKey: string): void {
+  const normalized = apiKey.trim();
+  if (!normalized || normalized === preferredAnthropicApiKey) {
+    return;
+  }
+
+  preferredAnthropicApiKey = normalized;
+  process.env.ANTHROPIC_API_KEY = normalized;
+  log("INFO", "Promoted working Anthropic API key for the current run.");
+}
+
+function isClaudeAuthenticationError(status: number, body: string): boolean {
+  return status === 401 && /authentication_error|invalid x-api-key/i.test(body);
+}
+
+const WORDPRESS_PRODUCTION_SYSTEM_PROMPT = `You are a senior WordPress developer specialized in:
+- WordPress Themes
+- WordPress Plugins
+- WooCommerce
+- Gutenberg
+- Elementor compatibility
+- SEO optimization
+- WordPress Coding Standards
+- WordPress security best practices
+
+Your task is to generate production-ready WordPress code.
+
+CRITICAL RULES:
+- Never generate plain PHP applications.
+- Always follow WordPress architecture.
+- Generate upload-ready WordPress themes/plugins.
+- Follow WordPress Coding Standards.
+- Use WordPress APIs whenever possible.
+- Use hooks/actions/filters correctly.
+- Use wp_enqueue_script/style.
+- Sanitize and escape all user data.
+- Use nonce verification for forms.
+- Never directly trust $_POST, $_GET.
+- Use translation-ready functions (__ and _e).
+- Generate responsive layouts when UI is involved.
+- Generate SEO-friendly HTML structure.
+- Support latest WordPress version.
+- Support WooCommerce if ecommerce requested.
+- Use semantic HTML.
+- Avoid inline CSS and JS.
+- Separate logic and presentation.
+- Generate complete file structure.
+- Generate code that works immediately after installation.
+- Never generate malicious WordPress code.
+- Never generate obfuscated PHP.
+- Never use eval().`;
 
 const LLM_SYSTEM =
-  "You are a senior WordPress theme developer and CSS expert. " +
-  "Respond ONLY with valid JSON — no markdown fences, no prose explanations outside the JSON. " +
+  WORDPRESS_PRODUCTION_SYSTEM_PROMPT +
+  " Respond ONLY with valid JSON — no markdown fences, no prose explanations outside the JSON. " +
   "Return the raw JSON object or array directly. " +
   "When generating CSS: (1) every var(--X) reference must have a matching :root declaration in the same style.css, " +
   "(2) transition/animation rules must be inside @media (prefers-reduced-motion: no-preference) blocks, " +
   "(3) never use bare hex colors for text or backgrounds — always use CSS custom properties. " +
-  "When generating PHP: every template file must start with <?php, check ABSPATH, and use WordPress escaping functions.";
+  "When generating PHP: every template or bootstrap file must start with <?php, use WordPress hooks/APIs, check ABSPATH where appropriate, and use WordPress escaping functions.";
 
 async function callLLM(prompt: string, maxTokens = 16384): Promise<unknown> {
   log("DEBUG", `LLM call (${USE_MOCK ? "MOCK" : "LIVE"}) — prompt ${prompt.length} chars, maxTokens ${maxTokens}`);
@@ -556,92 +856,104 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function claudeAPI(prompt: string, maxTokens = 16384): Promise<unknown> {
-  const apiKey = process.env.ANTHROPIC_API_KEY!;
   const model = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514";
+  const apiKeys = getAnthropicApiKeyCandidates();
+
+  if (apiKeys.length === 0) {
+    throw new Error("Claude API key is missing. Set ANTHROPIC_API_KEY or enable FORCE_MOCK_MODE=true.");
+  }
 
   const MAX_API_RETRIES = 6;
-  // Max time to wait for a single fetch (large theme batches can exceed 3 minutes under API load)
-  const FETCH_TIMEOUT_MS = 300_000;
+  // Max time to wait for a single fetch (large theme batches can exceed 5 minutes under API load)
+  const FETCH_TIMEOUT_MS = 420_000;
 
-  for (let apiAttempt = 1; apiAttempt <= MAX_API_RETRIES; apiAttempt++) {
-    let res: Response;
-    const controller = new AbortController();
-    const fetchTimer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: maxTokens,
-          system: LLM_SYSTEM,
-          messages: [{ role: "user", content: prompt }],
-        }),
-        signal: controller.signal,
-      });
-    } catch (fetchErr: unknown) {
+  for (let keyIndex = 0; keyIndex < apiKeys.length; keyIndex++) {
+    const apiKey = apiKeys[keyIndex];
+
+    for (let apiAttempt = 1; apiAttempt <= MAX_API_RETRIES; apiAttempt++) {
+      let res: Response;
+      const controller = new AbortController();
+      const fetchTimer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      try {
+        res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: maxTokens,
+            system: LLM_SYSTEM,
+            messages: [{ role: "user", content: prompt }],
+          }),
+          signal: controller.signal,
+        });
+      } catch (fetchErr: unknown) {
+        clearTimeout(fetchTimer);
+        const isAbort = fetchErr instanceof Error && fetchErr.name === "AbortError";
+        const msg = isAbort
+          ? `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s`
+          : fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+        if (apiAttempt < MAX_API_RETRIES) {
+          const waitSec = Math.min(5 * 2 ** (apiAttempt - 1), 30);
+          log("WARN", `Network error: ${msg}. Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
+          await sleep(waitSec * 1000);
+          continue;
+        }
+        throw new Error(`Network error after ${MAX_API_RETRIES} retries: ${msg}`);
+      }
       clearTimeout(fetchTimer);
-      // Network-level errors: connection reset, DNS failure, AbortError (timeout), etc.
-      const isAbort = fetchErr instanceof Error && fetchErr.name === "AbortError";
-      const msg = isAbort
-        ? `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s`
-        : fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-      if (apiAttempt < MAX_API_RETRIES) {
-        // Exponential backoff: 5s, 10s, 20s, 30s, 30s — much faster than linear 15×N
-        const waitSec = Math.min(5 * 2 ** (apiAttempt - 1), 30);
-        log("WARN", `Network error: ${msg}. Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
-        await sleep(waitSec * 1000);
-        continue;
+
+      if (res.status === 429 || res.status === 529) {
+        const retryAfter = res.headers.get("retry-after");
+        const defaultWait = res.status === 529 ? 15 * (apiAttempt + 1) : 30 * apiAttempt;
+        const waitSec = retryAfter ? parseInt(retryAfter, 10) : defaultWait;
+        if (apiAttempt < MAX_API_RETRIES) {
+          const reason = res.status === 429 ? "Rate limited" : "API overloaded";
+          log("WARN", `${reason} (${res.status}). Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
+          await sleep(waitSec * 1000);
+          continue;
+        }
+        const body = await res.text();
+        throw new Error(`API ${res.status} after ${MAX_API_RETRIES} retries: ${body.slice(0, 500)}`);
       }
-      throw new Error(`Network error after ${MAX_API_RETRIES} retries: ${msg}`);
-    }
-    clearTimeout(fetchTimer);
 
-    // Handle rate limiting (429) and overloaded (529) with exponential backoff
-    if (res.status === 429 || res.status === 529) {
-      const retryAfter = res.headers.get("retry-after");
-      const defaultWait = res.status === 529 ? 15 * (apiAttempt + 1) : 30 * apiAttempt;
-      const waitSec = retryAfter ? parseInt(retryAfter, 10) : defaultWait;
-      if (apiAttempt < MAX_API_RETRIES) {
-        const reason = res.status === 429 ? "Rate limited" : "API overloaded";
-        log("WARN", `${reason} (${res.status}). Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
-        await sleep(waitSec * 1000);
-        continue;
+      if (!res.ok) {
+        const body = await res.text();
+        if (isClaudeAuthenticationError(res.status, body) && keyIndex + 1 < apiKeys.length) {
+          log("WARN", "Claude auth failed with current ANTHROPIC_API_KEY; retrying once with .env key.");
+          break;
+        }
+        throw new Error(`Claude API ${res.status}: ${body.slice(0, 500)}`);
       }
-      const body = await res.text();
-      throw new Error(`API ${res.status} after ${MAX_API_RETRIES} retries: ${body.slice(0, 500)}`);
+
+      const json = (await res.json()) as {
+        content?: { text?: string }[];
+        stop_reason?: string;
+      };
+      if (apiKey !== (process.env.ANTHROPIC_API_KEY?.trim() || "")) {
+        promoteWorkingAnthropicApiKey(apiKey);
+      }
+      const text = json.content?.[0]?.text ?? "";
+
+      if (json.stop_reason === "max_tokens") {
+        log("WARN", `Response truncated (hit max_tokens=${maxTokens}). Response length: ${text.length} chars`);
+        throw new Error(
+          `LLM response truncated at ${maxTokens} tokens. ` +
+          `Try reducing batch size or increasing max_tokens.`
+        );
+      }
+
+      const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (fenced) return JSON.parse(fenced[1].trim());
+
+      const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
+      if (raw) return JSON.parse(raw[1]);
+
+      throw new Error(`No JSON in LLM response: ${text.slice(0, 300)}`);
     }
-
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Claude API ${res.status}: ${body.slice(0, 500)}`);
-    }
-
-    const json = (await res.json()) as {
-      content?: { text?: string }[];
-      stop_reason?: string;
-    };
-    const text = json.content?.[0]?.text ?? "";
-
-    if (json.stop_reason === "max_tokens") {
-      log("WARN", `Response truncated (hit max_tokens=${maxTokens}). Response length: ${text.length} chars`);
-      throw new Error(
-        `LLM response truncated at ${maxTokens} tokens. ` +
-        `Try reducing batch size or increasing max_tokens.`
-      );
-    }
-
-    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (fenced) return JSON.parse(fenced[1].trim());
-
-    const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
-    if (raw) return JSON.parse(raw[1]);
-
-    throw new Error(`No JSON in LLM response: ${text.slice(0, 300)}`);
   }
 
   throw new Error("Claude API: exhausted all retries");
@@ -654,7 +966,7 @@ async function claudeAPI(prompt: string, maxTokens = 16384): Promise<unknown> {
 function mockRouter(prompt: string): unknown {
   log("WARN", "Mock LLM active — set ANTHROPIC_API_KEY for real generation");
   if (prompt.includes("[ANALYZE_IDEA]")) return mockAnalysis(prompt);
-  if (prompt.includes("[BUILD_SPEC]")) return mockSpec();
+  if (prompt.includes("[BUILD_SPEC]")) return mockSpec(prompt);
   if (prompt.includes("[GENERATE_CODE]")) return mockCodeGen(prompt);
   if (prompt.includes("[FIX_BUILD]")) return mockBuildFix();
   if (prompt.includes("[FIX_THEME_CONTRACT]")) return { explanation: "Mock mode skipped theme contract repair", files: [] };
@@ -692,13 +1004,111 @@ function extractBrandName(idea: string): string {
 function mockAnalysis(prompt: string): FeatureAnalysis {
   const m = prompt.match(/Idea:\s*"([^"]+)"/);
   const idea = m?.[1] ?? "web application";
+  const projectType = inferProjectType(idea);
   const brandName = extractBrandName(idea);
   const slug = idea
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "")
     .slice(0, 40);
+
+  if (projectType === "wordpress_plugin") {
+    return {
+      projectType,
+      projectName: slug || "wordpress-plugin",
+      brandName,
+      summary: `A production-ready WordPress plugin for ${brandName}: ${idea}`,
+      targetAudience: `Site owners and administrators deploying ${brandName} functionality inside WordPress.`,
+      goals: [
+        `Deliver an upload-ready plugin package for ${brandName}`,
+        "Provide secure admin workflows with nonce and capability enforcement",
+        "Support WooCommerce sites when ecommerce integration is requested",
+        "Keep the codebase modular for SaaS and agency reuse",
+      ],
+      features: [
+        {
+          name: "Plugin Bootstrap",
+          description: "WordPress plugin bootstrap file with metadata, constants, hooks, and loader wiring",
+          priority: "high",
+          acceptanceCriteria: [
+            "Plugin activates without PHP errors",
+            "Bootstrap registers activation and deactivation hooks",
+            "Core services are loaded through modular includes",
+          ],
+        },
+        {
+          name: "Admin Settings",
+          description: "Admin page or settings registration using WordPress APIs with sanitized persistence",
+          priority: "high",
+          acceptanceCriteria: [
+            "Admin forms include nonce and capability checks",
+            "Submitted settings are sanitized before storage",
+            "All output is properly escaped in admin views",
+          ],
+        },
+        {
+          name: "Public Integration",
+          description: "Frontend or REST-facing behavior exposed through hooks, shortcodes, or public assets",
+          priority: "medium",
+          acceptanceCriteria: [
+            "Public assets are enqueued through wp_enqueue_script/style",
+            "Frontend behavior works without inline JS or CSS",
+            "Translations use the plugin text domain consistently",
+          ],
+        },
+        {
+          name: "WooCommerce Compatibility",
+          description: "Optional WooCommerce integration guarded behind plugin availability checks",
+          priority: /woocommerce|shop|product|ecommerce/i.test(idea) ? "high" : "low",
+          acceptanceCriteria: [
+            "WooCommerce-specific hooks are only used when WooCommerce is available",
+            "Plugin avoids fatal errors on sites without WooCommerce",
+            "Integration points follow native WooCommerce hooks and APIs",
+          ],
+        },
+      ],
+      userStories: [
+        { role: "site admin", goal: "I want to activate the plugin and use it immediately", rationale: "so that deployment is fast and predictable" },
+        { role: "site admin", goal: "I want clear settings with validation", rationale: "so that I can configure the plugin safely" },
+        { role: "agency developer", goal: "I want modular classes and hooks", rationale: "so that I can extend the plugin for multiple clients" },
+        { role: "store owner", goal: "I want WooCommerce compatibility when needed", rationale: "so that the plugin supports ecommerce workflows without breaking non-shop sites" },
+      ],
+      designDirection: {
+        tone: "clean, professional, WordPress-native",
+        colorPalette: "neutral admin-safe palette with strong contrast",
+        typography: "WordPress admin system typography with clear hierarchy",
+        inspiration: ["WordPress plugin handbook", `${brandName} product workflow`],
+      },
+      nonFunctionalRequirements: {
+        performance: [
+          "Load only the hooks and assets needed for the current request",
+          "Avoid unnecessary database writes and remote requests",
+        ],
+        accessibility: [
+          "Admin UI follows WordPress accessibility expectations",
+          "Interactive controls include labels and keyboard support",
+        ],
+        seo: [
+          "Frontend output uses semantic markup when rendering HTML",
+          "Plugin avoids duplicate or conflicting SEO meta behavior by default",
+        ],
+      },
+      contentRequirements: [
+        "Plugin header metadata",
+        "Admin labels and help text",
+        "Frontend strings prepared for translation",
+        "readme.txt installation and usage copy",
+      ],
+      techStack: {
+        frontend: ["PHP", "WordPress", "CSS3", "Vanilla JS"],
+        backend: ["WordPress", "PHP"],
+        devtools: ["php", "wp-cli"],
+      },
+    };
+  }
+
   return {
+    projectType,
     projectName: slug || "my-app",
     brandName,
     summary: `A modern landing page for ${brandName}: ${idea}`,
@@ -791,9 +1201,9 @@ function mockAnalysis(prompt: string): FeatureAnalysis {
     ],
     designDirection: {
       tone: "professional, trustworthy, modern",
-      colorPalette: "deep navy (#0f172a) + electric indigo (#6366f1) + clean white (#f8fafc)",
-      typography: "Heavy black-weight display font for headlines, clean medium-weight Inter for body text",
-      inspiration: [`${brandName} brand identity`, "Modern e-commerce design"],
+      colorPalette: "deep mineral blue (#0f3b53) + bright cyan (#22c7f2) + warm white (#f7fbfc) + graphite (#10212b)",
+      typography: "Strong display grotesk or industrial serif for headlines paired with a clean humanist sans for body copy",
+      inspiration: [`${brandName} brand identity`, "Editorial product landing pages", "High-end industrial brand websites"],
     },
     nonFunctionalRequirements: {
       performance: [
@@ -813,9 +1223,9 @@ function mockAnalysis(prompt: string): FeatureAnalysis {
       ],
     },
     contentRequirements: [
-      "High-resolution hero background image (1920×1080)",
-      "Product photography: at least 4 bike images in portrait format (600×800)",
-      "Category thumbnails: 4 lifestyle images in landscape format (800×600)",
+      "Hero visual system: a framed product visual, local SVG illustration, or layered brand composition instead of a random stock-photo background",
+      "Product visuals: at least 4 strong card visuals in portrait format (600×800), using local SVG or stable art-directed assets when photography is unavailable",
+      "Category thumbnails: 4 intentional visuals in landscape format (800×600) with clear hierarchy and overlay legibility",
       "Editorial: 3–5 blog articles with cover images and body copy",
       "About section: brand story paragraph, logo, and 4 numeric key stats",
       "Archives: 6 gallery images (any aspect ratio, will be cropped to square)",
@@ -828,8 +1238,44 @@ function mockAnalysis(prompt: string): FeatureAnalysis {
   };
 }
 
-function mockSpec(): ProjectSpec {
+function mockSpec(prompt: string): ProjectSpec {
+  const projectType = prompt.includes('"projectType": "wordpress_plugin"')
+    ? "wordpress_plugin"
+    : "wordpress_theme";
+  const slugMatch = prompt.match(/"projectName":\s*"([^"]+)"/);
+  const slug = slugifyPackageName(slugMatch?.[1] ?? "wordpress-package");
+
+  if (projectType === "wordpress_plugin") {
+    return {
+      projectType,
+      architecture: "WordPress Plugin with modular includes, admin/public layers, activation hooks, and optional WooCommerce integration guards",
+      fileStructure: [
+        { filePath: `${slug}.php`, description: "Plugin bootstrap with metadata and service wiring" },
+        { filePath: "uninstall.php", description: "Cleanup logic executed on uninstall" },
+        { filePath: "readme.txt", description: "Plugin readme and installation instructions" },
+        { filePath: "includes/class-loader.php", description: "Hook registration helper" },
+        { filePath: "includes/class-plugin.php", description: "Main plugin coordinator" },
+        { filePath: "includes/class-security.php", description: "Sanitization, nonce, and capability helpers" },
+        { filePath: "includes/class-activator.php", description: "Activation tasks" },
+        { filePath: "includes/class-deactivator.php", description: "Deactivation tasks" },
+        { filePath: "includes/class-api.php", description: "REST or integration layer" },
+        { filePath: "admin/class-admin.php", description: "Admin hooks, settings page, and assets" },
+        { filePath: "public/class-public.php", description: "Public-facing hooks and assets" },
+        { filePath: "assets/css/admin.css", description: "Admin styles" },
+        { filePath: "assets/css/public.css", description: "Frontend styles" },
+        { filePath: "assets/js/admin.js", description: "Admin behavior" },
+        { filePath: "assets/js/public.js", description: "Public behavior" },
+        { filePath: "languages/index.php", description: "Language directory placeholder" },
+        { filePath: "templates/settings-page.php", description: "Admin settings UI template" },
+      ],
+      apiEndpoints: [],
+      buildScript: "find . -name \"*.php\" -print0 | xargs -0 -n1 php -l",
+      testScript: "find . -name \"*.php\" -print0 | xargs -0 -n1 php -l",
+    };
+  }
+
   return {
+    projectType,
     architecture: "WordPress Theme with custom template parts, Customizer API, and vanilla CSS/JS",
     fileStructure: [
       { filePath: "style.css", description: "Theme styles with WordPress header comment" },
@@ -859,6 +1305,247 @@ function mockSpec(): ProjectSpec {
 }
 
 function mockCodeGen(prompt: string): GeneratedFile[] {
+  if (/Project type\s*:\s*wordpress_plugin/.test(prompt)) {
+  const projectMatch = prompt.match(/^Project slug\s*:\s*(.+)$/m) ?? prompt.match(/^Project:\s*(.+)$/m);
+  const brandMatch = prompt.match(/^Brand name\s*:\s*(.+)$/m);
+  const slug = slugifyPackageName(projectMatch?.[1]?.trim() ?? "wordpress-plugin");
+  const brandName = brandMatch?.[1]?.trim() || "My Plugin";
+  const prefix = slug.replace(/-/g, "_");
+  const prefixConstant = prefix.toUpperCase();
+
+  const pluginFiles: GeneratedFile[] = [
+    {
+    filePath: `${slug}.php`,
+    content: `<?php
+/**
+ * Plugin Name: ${brandName}
+ * Description: Production-ready WordPress plugin bootstrap generated by the AI agent.
+ * Version: 1.0.0
+ * Author: AI Agent
+ * Text Domain: ${slug}
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+define( '${prefixConstant}_VERSION', '1.0.0' );
+define( '${prefixConstant}_PATH', plugin_dir_path( __FILE__ ) );
+define( '${prefixConstant}_URL', plugin_dir_url( __FILE__ ) );
+
+require_once ${prefixConstant}_PATH . 'includes/class-loader.php';
+require_once ${prefixConstant}_PATH . 'includes/class-security.php';
+require_once ${prefixConstant}_PATH . 'includes/class-activator.php';
+require_once ${prefixConstant}_PATH . 'includes/class-deactivator.php';
+require_once ${prefixConstant}_PATH . 'includes/class-plugin.php';
+
+register_activation_hook( __FILE__, array( '${prefix}_Activator', 'activate' ) );
+register_deactivation_hook( __FILE__, array( '${prefix}_Deactivator', 'deactivate' ) );
+
+function ${prefix}_run_plugin() {
+  $plugin = new ${prefix}_Plugin();
+  $plugin->run();
+}
+
+${prefix}_run_plugin();
+`,
+    },
+    {
+    filePath: "includes/class-loader.php",
+    content: `<?php
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+class ${prefix}_Loader {
+  protected array $actions = array();
+
+  public function add_action( string $hook, object $component, string $callback, int $priority = 10, int $accepted_args = 1 ): void {
+    $this->actions[] = compact( 'hook', 'component', 'callback', 'priority', 'accepted_args' );
+  }
+
+  public function run(): void {
+    foreach ( $this->actions as $action ) {
+      add_action( $action['hook'], array( $action['component'], $action['callback'] ), $action['priority'], $action['accepted_args'] );
+    }
+  }
+}
+`,
+    },
+    {
+    filePath: "includes/class-security.php",
+    content: `<?php
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+class ${prefix}_Security {
+  public static function sanitize_text( string $value ): string {
+    return sanitize_text_field( wp_unslash( $value ) );
+  }
+}
+`,
+    },
+    {
+    filePath: "includes/class-activator.php",
+    content: `<?php
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+class ${prefix}_Activator {
+  public static function activate(): void {
+    flush_rewrite_rules();
+  }
+}
+`,
+    },
+    {
+    filePath: "includes/class-deactivator.php",
+    content: `<?php
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+class ${prefix}_Deactivator {
+  public static function deactivate(): void {
+    flush_rewrite_rules();
+  }
+}
+`,
+    },
+    {
+    filePath: "includes/class-plugin.php",
+    content: `<?php
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+require_once ${prefixConstant}_PATH . 'admin/class-admin.php';
+require_once ${prefixConstant}_PATH . 'public/class-public.php';
+
+class ${prefix}_Plugin {
+  protected ${prefix}_Loader $loader;
+
+  public function __construct() {
+    $this->loader = new ${prefix}_Loader();
+    $this->loader->add_action( 'plugins_loaded', new ${prefix}_Admin(), 'register' );
+    $this->loader->add_action( 'wp_enqueue_scripts', new ${prefix}_Public(), 'enqueue_assets' );
+  }
+
+  public function run(): void {
+    $this->loader->run();
+  }
+}
+`,
+    },
+    {
+    filePath: "admin/class-admin.php",
+    content: `<?php
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+class ${prefix}_Admin {
+  public function register(): void {
+    add_action( 'admin_menu', array( $this, 'register_menu' ) );
+    add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_assets' ) );
+  }
+
+  public function register_menu(): void {
+    add_menu_page(
+      esc_html__( '${brandName}', '${slug}' ),
+      esc_html__( '${brandName}', '${slug}' ),
+      'manage_options',
+      '${slug}',
+      array( $this, 'render_page' ),
+      'dashicons-admin-generic'
+    );
+  }
+
+  public function enqueue_assets(): void {
+    wp_enqueue_style( '${slug}-admin', ${prefixConstant}_URL . 'assets/css/admin.css', array(), ${prefixConstant}_VERSION );
+    wp_enqueue_script( '${slug}-admin', ${prefixConstant}_URL . 'assets/js/admin.js', array(), ${prefixConstant}_VERSION, true );
+  }
+
+  public function render_page(): void {
+    include ${prefixConstant}_PATH . 'templates/settings-page.php';
+  }
+}
+`,
+    },
+    {
+    filePath: "public/class-public.php",
+    content: `<?php
+if ( ! defined( 'ABSPATH' ) ) {
+  exit;
+}
+
+class ${prefix}_Public {
+  public function enqueue_assets(): void {
+    wp_enqueue_style( '${slug}-public', ${prefixConstant}_URL . 'assets/css/public.css', array(), ${prefixConstant}_VERSION );
+    wp_enqueue_script( '${slug}-public', ${prefixConstant}_URL . 'assets/js/public.js', array(), ${prefixConstant}_VERSION, true );
+  }
+}
+`,
+    },
+    {
+    filePath: "uninstall.php",
+    content: `<?php
+if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
+  exit;
+}
+`,
+    },
+    {
+    filePath: "readme.txt",
+    content: `=== ${brandName} ===
+Contributors: ai-agent
+Requires at least: 6.5
+Tested up to: 6.8
+Requires PHP: 8.1
+Stable tag: 1.0.0
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+
+Production-ready WordPress plugin generated by the AI agent.
+`,
+    },
+  ];
+
+  if (process.env.MOCK_BROKEN_PLUGIN_HEADER === "true") {
+    return pluginFiles.map((file) => {
+      if (file.filePath === `${slug}.php`) {
+        return {
+          ...file,
+          content: file.content.replace(/^ \* Plugin Name:.*\n/m, ""),
+        };
+      }
+      return file;
+    });
+  }
+
+  if (process.env.MOCK_BROKEN_PLUGIN_INCLUDE === "true") {
+    return pluginFiles.map((file) => {
+      if (file.filePath.endsWith(".php") && file.filePath === `${slug}.php`) {
+        const injectedContent = file.content.includes("includes/class-plugin.php")
+          ? file.content.replace(
+              `require_once ${prefixConstant}_PATH . 'includes/class-plugin.php';`,
+              `require_once ${prefixConstant}_PATH . 'includes/class-plugin.php';\nrequire_once ${prefixConstant}_PATH . 'includes/class-missing-fixture.php';`
+            )
+          : `${file.content.trimEnd()}\nrequire_once ${prefixConstant}_PATH . 'includes/class-missing-fixture.php';\n`;
+        return {
+          ...file,
+          content: injectedContent,
+        };
+      }
+      return file;
+    });
+  }
+
+  return pluginFiles;
+  }
+
   // Extract brand context passed in the [GENERATE_CODE] prompt
   const projectMatch = prompt.match(/^Project slug\s*:\s*(.+)$/m) ?? prompt.match(/^Project:\s*(.+)$/m);
   const ideaMatch    = prompt.match(/^User's idea\s*:\s*"([^"]+)"/m);
@@ -5101,7 +5788,27 @@ function mockCodeGen(prompt: string): GeneratedFile[] {
   ];
 
   // Apply brand name + slug replacement to ALL file contents in one pass
-  return files.map((f) => ({ ...f, content: brand(f.content) }));
+  const brandedFiles = files.map((f) => ({ ...f, content: brand(f.content) }));
+
+  if (process.env.MOCK_BROKEN_THEME_INCLUDE === "true") {
+    return brandedFiles.map((file) => {
+      if (file.filePath === "functions.php") {
+        const injectedContent = file.content.includes("/inc/theme-data.php")
+          ? file.content.replace(
+              "require_once THEME_DIR . '/inc/theme-data.php';",
+              "require_once THEME_DIR . '/inc/theme-data.php';\nrequire_once THEME_DIR . '/inc/missing-fixture.php';"
+            )
+          : `${file.content.trimEnd()}\nrequire_once get_template_directory() . '/inc/missing-fixture.php';\n`;
+        return {
+          ...file,
+          content: injectedContent,
+        };
+      }
+      return file;
+    });
+  }
+
+  return brandedFiles;
 }
 
 function mockBuildFix(): BuildFixResponse {
@@ -5133,13 +5840,18 @@ function mockCommitMsg(): CommitMessageResponse {
 
 async function ideaAnalyzer(ctx: SharedContext): Promise<AgentResult<FeatureAnalysis>> {
   try {
+    const inferredProjectType = inferProjectType(ctx.idea);
+    const projectLabel = getProjectTypeLabel(inferredProjectType);
     const prompt = `[ANALYZE_IDEA]
-Analyze the following web application idea and produce a thorough requirements document.
+${WORDPRESS_PRODUCTION_SYSTEM_PROMPT}
+
+Analyze the following ${projectLabel} request and produce a thorough requirements document.
 
 Idea: "${ctx.idea}"
 
 Respond with JSON matching this exact shape:
 {
+  "projectType": "wordpress_theme | wordpress_plugin",
   "projectName": "kebab-case-slug (ASCII only, no diacritics)",
   "brandName": "Human-readable brand/company name extracted from the idea (e.g. 'Hoàng Long', 'TechStore')",
   "summary": "One-sentence project summary",
@@ -5188,14 +5900,17 @@ Respond with JSON matching this exact shape:
 }
 
 Rules:
-- Map the idea into 6–8 features covering: Hero, Featured Products, Categories, Editorial/Blog, Archives/Gallery, About, Footer.
+- Set projectType to "${inferredProjectType}" unless the idea explicitly contradicts it.
+- If projectType is wordpress_theme, map the idea into 6–8 features covering: Hero, Featured Products, Categories, Editorial/Blog, Archives/Gallery, About, Footer.
+- If projectType is wordpress_plugin, map the idea into 4–6 plugin capabilities covering bootstrap, admin UX, security, public integration, validation, and optional WooCommerce compatibility.
 - Write 4–6 goals that are measurable (conversion rate, engagement, etc.).
 - Write 5–8 user stories covering the main journeys (discovery, browsing, purchasing intent, brand trust).
 - Each feature must have 2–3 acceptance criteria (specific, testable).
 - Design direction should be tailored to the topic/brand feel.
 - Non-functional requirements: 2–3 per category.
 - Content requirements: list 4–6 distinct content types needed.
-- Always use WordPress + PHP + CSS3 as tech stack.`;
+- Always use WordPress + PHP + CSS3 as tech stack.
+- Prioritize upload-ready output, coding standards, security, SEO, WooCommerce support when requested, and reuse for SaaS/agency delivery.`;
 
     const result = (await callLLM(prompt)) as FeatureAnalysis;
     ctx.analysis = result;
@@ -5213,8 +5928,21 @@ Rules:
 
 async function specBuilder(ctx: SharedContext): Promise<AgentResult<ProjectSpec>> {
   try {
+    const projectType = ctx.analysis?.projectType ?? inferProjectType(ctx.idea);
+    const projectLabel = getProjectTypeLabel(projectType);
+    const requiredStructure = projectType === "wordpress_plugin"
+      ? REQUIRED_PLUGIN_FILE_STRUCTURE
+      : REQUIRED_THEME_FILE_STRUCTURE;
+    const architectureHint = projectType === "wordpress_plugin"
+      ? "WordPress Plugin with modular includes, admin/public layers, security helpers, activation/deactivation hooks, and optional WooCommerce integration guards"
+      : "WordPress Theme with template parts, Customizer API, and vanilla CSS/JS";
+    const buildHint = projectType === "wordpress_plugin"
+      ? "find . -name \"*.php\" -print0 | xargs -0 -n1 php -l"
+      : "php -l *.php inc/*.php template-parts/*.php";
+
     // Pass only the fields specBuilder needs — avoids burning tokens on features/userStories
     const analysisForSpec = ctx.analysis ? {
+      projectType: ctx.analysis.projectType,
       projectName: ctx.analysis.projectName,
       brandName: ctx.analysis.brandName,
       summary: ctx.analysis.summary,
@@ -5225,24 +5953,29 @@ async function specBuilder(ctx: SharedContext): Promise<AgentResult<ProjectSpec>
     } : ctx.analysis;
 
     const prompt = `[BUILD_SPEC]
-Create a detailed project specification for a WordPress theme.
-Theme uses: PHP template-parts pattern, WordPress Customizer API, vanilla CSS + JS. WCAG 2.1 AA.
+${WORDPRESS_PRODUCTION_SYSTEM_PROMPT}
+
+Create a detailed project specification for a ${projectLabel}.
+If the analysis requests a theme, use a PHP template hierarchy with Customizer support, responsive layout, and vanilla CSS + JS.
+If the analysis requests a plugin, use a modular plugin architecture with includes/, admin/, public/, assets/, templates/, and uninstall.php.
+Validation must stay compatible with WordPress coding standards and upload-ready packaging.
 
 Analysis:
 ${JSON.stringify(analysisForSpec, null, 2)}
 
 Respond with JSON:
 {
-  "architecture": "WordPress Theme with template parts, Customizer API, and vanilla CSS/JS",
+  "projectType": "${projectType}",
+  "architecture": "${architectureHint}",
   "fileStructure": [
     { "filePath": "relative/path/file.php", "description": "Purpose" }
   ],
   "apiEndpoints": [],
-  "buildScript": "php -l *.php inc/*.php template-parts/*.php",
-  "testScript": "php -l *.php inc/*.php template-parts/*.php"
+  "buildScript": "${buildHint}",
+  "testScript": "${buildHint}"
 }
 
-${REQUIRED_FILE_STRUCTURE}
+${requiredStructure}
 
 Do NOT include test files.
 Do NOT include any Node.js, Vite, Next.js, React, or Tailwind files.`;
@@ -5264,17 +5997,30 @@ Do NOT include any Node.js, Vite, Next.js, React, or Tailwind files.`;
 async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedFile[]>> {
   try {
     const spec = ctx.spec!;
+    const projectType = ctx.analysis?.projectType ?? "wordpress_theme";
+    const isTheme = projectType === "wordpress_theme";
+    const pluginMainFile = isTheme ? null : getPluginMainFileFromSpec(spec, ctx.analysis?.projectName);
 
-    // Sort: core → inc → templates → template-parts → assets (ensures core theme files exist first)
+    // Sort core files first so dependent batches have the bootstrap or theme contract available.
     const priorityOrder = (fp: string): number => {
-      if (fp === "style.css") return 0;
-      if (fp === "functions.php") return 1;
-      if (fp.includes("inc/")) return 2;
-      if (fp === "header.php" || fp === "footer.php") return 3;
-      if (fp === "front-page.php" || fp === "index.php" || fp === "page.php" || fp === "single.php" || fp === "404.php" || fp === "archive.php") return 4;
-      if (fp.includes("template-parts/")) return 5;
-      if (fp.includes("assets/")) return 6;
-      return 5;
+      if (isTheme) {
+        if (fp === "style.css") return 0;
+        if (fp === "functions.php") return 1;
+        if (fp.includes("inc/")) return 2;
+        if (fp === "header.php" || fp === "footer.php") return 3;
+        if (fp === "front-page.php" || fp === "index.php" || fp === "page.php" || fp === "single.php" || fp === "404.php" || fp === "archive.php") return 4;
+        if (fp.includes("template-parts/")) return 5;
+        if (fp.includes("assets/")) return 6;
+        return 5;
+      }
+
+      if (fp === pluginMainFile) return 0;
+      if (fp.startsWith("includes/")) return 1;
+      if (fp.startsWith("admin/") || fp.startsWith("public/")) return 2;
+      if (fp.startsWith("templates/")) return 3;
+      if (fp.startsWith("assets/")) return 4;
+      if (fp.startsWith("languages/")) return 5;
+      return 6;
     };
     // Filter out binary files — LLM cannot generate them
     const BINARY_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot"]);
@@ -5282,15 +6028,30 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
     const binaryFiles = allPlannedRaw.filter((f) => BINARY_EXTS.has(path.extname(f.filePath).toLowerCase()));
     const allPlanned = allPlannedRaw.filter((f) => !BINARY_EXTS.has(path.extname(f.filePath).toLowerCase()));
     const BATCH_SIZE = 4;
-    const seedPaths = new Set([
-      "style.css",
-      "functions.php",
-      "inc/theme-data.php",
-      "inc/customizer.php",
-      "header.php",
-      "footer.php",
-      "front-page.php",
-    ]);
+    const deferredThemeStylePath = isTheme ? "style.css" : null;
+    const seedBatchesPaths = isTheme
+      ? [
+          new Set([
+            "functions.php",
+            "inc/theme-data.php",
+            "inc/customizer.php",
+          ]),
+          new Set([
+            "header.php",
+            "footer.php",
+            "front-page.php",
+          ]),
+        ]
+      : [
+          new Set([
+            pluginMainFile ?? `${ctx.analysis?.projectName ?? "wordpress-plugin"}.php`,
+            "includes/class-loader.php",
+            "includes/class-plugin.php",
+            "includes/class-security.php",
+            "includes/class-activator.php",
+            "includes/class-deactivator.php",
+          ]),
+        ];
 
     // Generate placeholder for binary files (e.g. screenshot.png)
     for (const bf of binaryFiles) {
@@ -5309,14 +6070,23 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
     }
 
     // Split files into batches to avoid truncated LLM responses
-    const seedBatch = allPlanned.filter((file) => seedPaths.has(file.filePath));
-    const remainingFiles = allPlanned.filter((file) => !seedPaths.has(file.filePath));
+    const seededPaths = new Set(seedBatchesPaths.flatMap((seedBatch) => [...seedBatch]));
+    const seedBatches = seedBatchesPaths
+      .map((seedPathSet) => allPlanned.filter((file) => seedPathSet.has(file.filePath)))
+      .filter((batch) => batch.length > 0);
+    const remainingFiles = allPlanned.filter((file) => !seededPaths.has(file.filePath) && file.filePath !== deferredThemeStylePath);
+    const deferredThemeStyleBatch = deferredThemeStylePath
+      ? allPlanned.filter((file) => file.filePath === deferredThemeStylePath)
+      : [];
     const batches: FileSpec[][] = [];
-    if (seedBatch.length > 0) {
+    for (const seedBatch of seedBatches) {
       batches.push(seedBatch);
     }
     for (let i = 0; i < remainingFiles.length; i += BATCH_SIZE) {
       batches.push(remainingFiles.slice(i, i + BATCH_SIZE));
+    }
+    if (deferredThemeStyleBatch.length > 0) {
+      batches.push(deferredThemeStyleBatch);
     }
 
     log("INFO", `Generating code in ${batches.length} batch(es) for ${allPlanned.length} files`);
@@ -5350,16 +6120,50 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
         return `\n⚠️  CSS variables defined in style.css (use ONLY these — never invent new var names):\n${capped}\n`;
       })();
 
+      const dataContractBlock = (() => {
+        const themeData = seedFiles.find((f) => f.filePath === "inc/theme-data.php");
+        if (!themeData) return "";
+        const summaries = [
+          `${actualPrefix}_get_site_config`,
+          `${actualPrefix}_get_products`,
+          `${actualPrefix}_get_categories`,
+          `${actualPrefix}_get_articles`,
+          `${actualPrefix}_get_gallery`,
+        ].map((fnName) => {
+          const block = extractPhpFunctionBlock(themeData.content, fnName);
+          if (!block) return null;
+          const keys = [...block.matchAll(/['"]([A-Za-z0-9_]+)['"]\s*=>/g)].map((match) => match[1]);
+          const uniqueKeys = [...new Set(keys)].slice(0, 24);
+          return `${fnName}: ${uniqueKeys.join(", ")}`;
+        }).filter((entry): entry is string => Boolean(entry));
+        if (summaries.length === 0) return "";
+        return `\n⚠️  Approved data keys from inc/theme-data.php (template parts MUST use ONLY these keys unless the same batch updates theme-data.php first):\n${summaries.join("\n")}\n`;
+      })();
+
+      const templateStyleBlocksBlock = (() => {
+        if (!batch.some((file) => file.filePath === "style.css")) return "";
+        const templateSummaries = seedFiles
+          .filter((file) => file.filePath.startsWith("template-parts/") && file.filePath.endsWith(".php"))
+          .map((file) => {
+            const blocks = [...extractTemplateStyleBlocks(file.content)].sort();
+            return blocks.length > 0 ? `${file.filePath}: ${blocks.join(", ")}` : null;
+          })
+          .filter((entry): entry is string => Boolean(entry));
+        if (templateSummaries.length === 0) return "";
+        return `\n⚠️  Template block classes that style.css MUST cover exactly:\n${templateSummaries.join("\n")}\n`;
+      })();
+
       const batchHasCss = batch.some((f) => f.filePath.endsWith(".css"));
       const designSystemForBatch = batchHasCss ? DESIGN_SYSTEM : DESIGN_SYSTEM_PHP;
 
-      const prompt = `[GENERATE_CODE]
+      const prompt = isTheme ? `[GENERATE_CODE]
 Generate beautiful, production-quality WordPress theme code for a landing page.
 
 BE CREATIVE with the visual design — make it stunning, modern, and unique.
 The design should feel premium and polished, with thoughtful use of color, typography, and spacing.
 
 Project slug  : ${ctx.analysis?.projectName}
+Project type  : wordpress_theme
 Brand name    : ${ctx.analysis?.brandName ?? ctx.idea}
 PHP prefix    : ${actualPrefix}_  (ALL PHP functions MUST start with this prefix)
 Text domain   : ${ctx.analysis?.projectName}
@@ -5373,11 +6177,11 @@ Full project file list: ${allPlanned.map((f) => f.filePath).join(", ")}
 - The brand/company name shown in header, footer, and all copy IS: "${ctx.analysis?.brandName ?? ctx.idea}"
 - ALL product names, categories, articles, hero copy, about text MUST relate to: "${ctx.idea}"
 - Do NOT use "Premium Bikes", "bikes", "bicycle", or any unrelated placeholder topic
-- Use loremflickr.com for ALL images: https://loremflickr.com/{width}/{height}/{keyword1},{keyword2}?lock={n}
-  Keywords MUST relate to the theme topic (e.g. battery,energy for a battery store). Use different ?lock=N per item.
+- Do NOT use loremflickr.com, picsum.photos, placehold.co, dummyimage.com, or any remote placeholder image service.
+- When imagery is needed, use local SVG files under assets/images/ or CSS/inline SVG visual treatments that do not require external network fetches.
 
 ${designSystemForBatch}
-${cssVarsBlock}${existingContext}
+${cssVarsBlock}${dataContractBlock}${templateStyleBlocksBlock}${existingContext}
 Generate ONLY these files (batch ${batchIdx + 1}/${batches.length}):
 ${fileList}
 
@@ -5416,6 +6220,14 @@ CRITICAL rules (violating these causes errors):
 - DATA CONTRACT SOURCE OF TRUTH: inc/theme-data.php is the only source of truth for array shapes.
   If a template needs keys like slug, specs, date_iso, location, author.avatar, or CTA URLs, define those keys in the corresponding data function FIRST and then use those exact keys in the template.
   Never assume derived aliases exist unless you explicitly define them in inc/theme-data.php in the same response.
+- VISUAL SAFETY: choose a clean, premium layout over a busy one. Prefer one strong hero image, one text column, and one visual column.
+  Do NOT stack multiple floating cards, overlapping badges, or dense overlays that can collide with hero copy on tablet/mobile.
+- MOBILE-FIRST DENSITY: every major section must work as a single-column mobile layout first, then expand progressively.
+  Keep mobile cards full-width, use 16-24px gaps, and avoid 3+ columns below 1024px.
+- CONTENT DENSITY: keep demo content concise.
+  Hero title <= 12 words, hero subtitle <= 32 words, card excerpts <= 24 words, about section <= 2 short paragraphs.
+  Generate at most 4 products, 3 categories, 4 articles, 6 gallery items, 3 testimonials, and 4 stats.
+- NO EMPTY EMBEDS: do not output blank maps, placeholder iframes, or empty visual panels. If no real embed is available, render a styled contact/info card instead.
 - CSS should use BEM naming (.section-hero, .section-hero__title, .section-hero--large)
 - CSS must use CSS custom properties (var(--color-primary)) for theming
 - CSS CLASS SYNC: Every CSS class written in style.css MUST exactly match the class attribute used in the PHP template for the same element. Never define a class like .categories-grid if the PHP uses class="section-categories__grid". Write both the HTML and CSS in the same pass and verify they match before returning.
@@ -5436,11 +6248,13 @@ CRITICAL rules (violating these causes errors):
 - Every <img> must have a descriptive alt="" attribute
 - Semantic HTML: use <main id="main-content">, <nav aria-label>, <header role="banner">, <footer role="contentinfo">
 - No React, No JSX, No TypeScript, No Tailwind, No Next.js
-- For images: use <img> tags or inline style="background-image: url('...')" with loremflickr.com URLs — always use keywords matching the theme topic
+- For images: use <img> tags with local SVG assets or inline SVG/CSS-based visuals. Avoid external placeholder URLs entirely.
 - Every file must be COMPLETE — no TODOs, no placeholders, no "..." shortcuts
 - DATA KEY DISCIPLINE: Before writing any template part, read the exact array structure returned by each data function in inc/theme-data.php (in the "Already generated files" context above).
   Access ONLY keys that are explicitly defined in those return arrays (e.g. if get_products() returns ['name','price','image','specs'], do NOT access $p['specifications'] or $p['description']).
   When inc/theme-data.php is not yet available (batch 0), define the data structure first in theme-data.php and match it exactly in templates.
+- ITERABLE SPECS RULE: if a template loops over $item['specs'] or $product['specs'], then specs MUST be an associative array in inc/theme-data.php.
+  If you need a single sentence, use summary or description instead of specs.
 - SECTION ANCHORS: if navigation or CTA links point to #featured-products, #categories, #editorial, #archives, or #about, the corresponding section markup MUST include that exact id attribute.
 
 WOOCOMMERCE RULES (default OFF):
@@ -5462,6 +6276,58 @@ WOOCOMMERCE RULES (default OFF):
 10. header.php uses the same registered menu location slug as functions.php, and the fallback menu is not empty in router preview.
 11. Every selector referenced in assets/js/main.js exists in the generated HTML.
 12. Every in-page anchor target used by nav/CTA links exists as a real id on the page.
+13. Any field iterated with foreach (especially specs) is actually an array in inc/theme-data.php, not a string.
+14. Hero layout remains readable at 390px width: no overlapping floating cards, no clipped CTAs, no multi-column text blocks on mobile.
+15. Editorial, categories, and gallery sections use concise demo content and do not dump oversized paragraphs or mismatched nested data structures into cards.
+16. No generated file contains remote placeholder-image URLs such as loremflickr, picsum, dummyimage, or placehold.
+
+Return ONLY the ${batch.length} file(s) listed above` : `[GENERATE_CODE]
+${WORDPRESS_PRODUCTION_SYSTEM_PROMPT}
+
+Generate production-ready WordPress plugin code.
+
+Project slug  : ${ctx.analysis?.projectName}
+Project type  : wordpress_plugin
+Brand name    : ${ctx.analysis?.brandName ?? ctx.idea}
+PHP prefix    : ${actualPrefix}_
+Text domain   : ${ctx.analysis?.projectName}
+Main file     : ${pluginMainFile}
+User's idea   : "${ctx.idea}"
+Full project file list: ${allPlanned.map((f) => f.filePath).join(", ")}
+
+${existingContext}
+Generate ONLY these files (batch ${batchIdx + 1}/${batches.length}):
+${fileList}
+
+Respond with a JSON array:
+[
+  { "filePath": "<exact path>", "content": "<full file content>" }
+]
+
+CRITICAL rules:
+- This is a WordPress plugin. Never generate a standalone PHP app.
+- The root bootstrap file MUST be ${pluginMainFile} and include a valid WordPress plugin header.
+- Use hooks, actions, and filters instead of manual bootstrapping patterns.
+- Register activation and deactivation hooks in the bootstrap file.
+- Use classes under includes/, admin/, and public/ to separate responsibilities.
+- Sanitize input on save and escape output on render.
+- Any admin or public form with side effects must include wp_nonce_field() and verify the nonce server-side.
+- Pair nonce checks with current_user_can() for privileged actions.
+- Use wp_enqueue_script() and wp_enqueue_style() for admin/public assets.
+- Use translation-ready strings with the ${ctx.analysis?.projectName} text domain.
+- Avoid inline CSS and JS.
+- Never use eval(), base64_decode(), remote shells, or obfuscated PHP.
+- If WooCommerce is required, guard every integration with class_exists( 'WooCommerce' ) or function_exists().
+- uninstall.php must check WP_UNINSTALL_PLUGIN before running cleanup.
+- readme.txt must be plain text, not markdown.
+- Return COMPLETE files only. No TODOs, no placeholders, no omitted methods.
+
+SELF-CHECK before returning JSON:
+1. The bootstrap file loads the required includes and registers hooks safely.
+2. Admin writes use sanitization, nonce verification, and capability checks.
+3. Public/admin assets are enqueued through WordPress hooks.
+4. No file assumes WooCommerce exists unless guarded.
+5. All strings are translation-ready and all output is escaped.
 
 Return ONLY the ${batch.length} file(s) listed above`;
 
@@ -5520,7 +6386,13 @@ Return ONLY the ${batch.length} file(s) listed above`;
     allFiles.push(...batch0Files);
     log("INFO", `Batch 1 done: ${batch0Files.length} files received`);
 
-    if (batches.length > 1) {
+    if (batches.length > 1 && isTheme) {
+      for (let index = 1; index < batches.length; index++) {
+        const files = await runBatch(index, batches[index], [...allFiles]);
+        allFiles.push(...files);
+        log("INFO", `Batch ${index + 1} done: ${files.length} files received`);
+      }
+    } else if (batches.length > 1) {
       // Short cooldown after batch 0 before firing parallel PHP batches
       await sleep(2_000);
 
@@ -5544,7 +6416,12 @@ Return ONLY the ${batch.length} file(s) listed above`;
 
     await fs.mkdir(ctx.workspacePath, { recursive: true });
     await Promise.all(allFiles.map((f) => writeFileSafe(ctx.workspacePath, f.filePath, f.content)));
-    await repairThemeContract(ctx);
+    if (isTheme) {
+      await repairThemeContract(ctx);
+      await assertThemeGenerationHardChecks(ctx);
+    } else {
+      await assertPluginGenerationHardChecks(ctx);
+    }
 
     log("INFO", `Code generated: ${allFiles.length} files written to ${ctx.workspacePath}`);
     return { success: true, data: allFiles };
@@ -5599,9 +6476,20 @@ interface SourceSnippet {
   content: string;
 }
 
+interface ThemeRepairBatch {
+  issues: ThemeContractIssue[];
+  anchors: string[];
+}
+
 interface ThemeContractIssue {
+  code: "forbidden-walker" | "forbidden-include" | "missing-include" | "forbidden-helper" | "missing-data-function" | "data-schema-mismatch" | "missing-style-block" | "placeholder-asset" | "missing-plugin-bootstrap" | "missing-plugin-header";
   filePath: string;
   reason: string;
+}
+
+interface PhpIncludeReference {
+  targetPath: string;
+  statement: string;
 }
 
 function normalizeProjectPath(projectDir: string, filePath: string): string {
@@ -5613,6 +6501,139 @@ function normalizeProjectPath(projectDir: string, filePath: string): string {
 
 function escapeRegex(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractStaticPhpIncludeReferences(content: string): PhpIncludeReference[] {
+  const refs: PhpIncludeReference[] = [];
+  const pattern = /(?:require|include)(?:_once)?\s+(?:(?:get_template_directory\(\)|__DIR__|THEME_DIR|[A-Z0-9_]+_PATH)\s*\.\s*)'\/?([^'\n]+\.php)'\s*;/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(content)) !== null) {
+    refs.push({
+      targetPath: match[1],
+      statement: match[0].trim(),
+    });
+  }
+
+  return refs;
+}
+
+function extractPhpFunctionBlock(content: string, functionName: string): string | null {
+  const startPattern = new RegExp(`function\\s+${escapeRegex(functionName)}\\s*\\(`);
+  const startMatch = startPattern.exec(content);
+  if (!startMatch || startMatch.index < 0) {
+    return null;
+  }
+
+  const blockStart = content.indexOf("{", startMatch.index);
+  if (blockStart < 0) {
+    return null;
+  }
+
+  let depth = 0;
+  for (let index = blockStart; index < content.length; index++) {
+    const char = content[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return content.slice(startMatch.index, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractTemplateDataExpectations(content: string, phpPrefix: string): Map<string, Set<string>> {
+  const expectations = new Map<string, Set<string>>();
+  const variableSources = new Map<string, string>();
+  const assignmentPattern = new RegExp(`\\$(\\w+)\\s*=\\s*(${escapeRegex(phpPrefix)}_get_[A-Za-z0-9_]+)\\s*\\(`, "g");
+  let match: RegExpExecArray | null;
+
+  while ((match = assignmentPattern.exec(content)) !== null) {
+    variableSources.set(match[1], match[2]);
+    if (!expectations.has(match[2])) {
+      expectations.set(match[2], new Set<string>());
+    }
+  }
+
+  for (let pass = 0; pass < 3; pass++) {
+    const foreachPattern = /foreach\s*\(\s*\$(\w+)(?:\[['"]([A-Za-z0-9_]+)['"]\])?\s+as\s+(?:\$\w+\s*=>\s*)?\$(\w+)\s*\)/g;
+    while ((match = foreachPattern.exec(content)) !== null) {
+      const parentVar = match[1];
+      const nestedKey = match[2];
+      const childVar = match[3];
+      const functionName = variableSources.get(parentVar);
+      if (!functionName) {
+        continue;
+      }
+
+      variableSources.set(childVar, functionName);
+      if (!expectations.has(functionName)) {
+        expectations.set(functionName, new Set<string>());
+      }
+      if (nestedKey) {
+        expectations.get(functionName)?.add(nestedKey);
+      }
+    }
+  }
+
+  for (const [varName, functionName] of variableSources.entries()) {
+    if (!expectations.has(functionName)) {
+      expectations.set(functionName, new Set<string>());
+    }
+
+    const keyPattern = new RegExp(`\\$${escapeRegex(varName)}\\[['"]([A-Za-z0-9_]+)['"]\\]`, "g");
+    while ((match = keyPattern.exec(content)) !== null) {
+      expectations.get(functionName)?.add(match[1]);
+    }
+  }
+
+  return expectations;
+}
+
+function extractTemplateStyleBlocks(content: string): Set<string> {
+  const blocks = new Set<string>();
+  const classPattern = /class\s*=\s*["']([^"']+)["']/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = classPattern.exec(content)) !== null) {
+    const tokens = match[1].split(/\s+/).filter(Boolean);
+    for (const token of tokens) {
+      const baseToken = token.split("--")[0].split("__")[0];
+      if (/^(section-|site-header|site-footer|product-card|category-card|editorial-card|gallery-card|stat-item|back-to-top)/.test(baseToken)) {
+        blocks.add(baseToken);
+      }
+    }
+  }
+
+  return blocks;
+}
+
+function extractPlaceholderAssetReferences(content: string): string[] {
+  const refs = new Set<string>();
+  const pattern = /https?:\/\/(?:[^\s"'()]+\.)?(?:loremflickr\.com|picsum\.photos|placehold\.co|via\.placeholder\.com|placehold\.it|dummyimage\.com)[^\s"'()]*/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(content)) !== null) {
+    refs.add(match[0]);
+  }
+
+  return [...refs];
+}
+
+function logContractIssueSummary(scope: string, issues: ThemeContractIssue[]): void {
+  if (issues.length === 0) {
+    log("INFO", `${scope}: no contract issues found`);
+    return;
+  }
+
+  log("WARN", `${scope}: ${issues.length} issue(s)`);
+  for (const issue of issues) {
+    log("WARN", `  • [${issue.code}] ${issue.filePath}: ${issue.reason}`);
+  }
 }
 
 function extractPhpReferences(err: string, projectDir: string): Array<{ path: string; line?: number }> {
@@ -5815,8 +6836,11 @@ async function compressImageIfNeeded(imagePath: string): Promise<Uint8Array> {
 async function callLLMWithImages(prompt: string, imagePaths: string[], maxTokens = 16384): Promise<unknown> {
   if (USE_MOCK) return mockRouter(prompt);
 
-  const apiKey = process.env.ANTHROPIC_API_KEY!;
   const model = process.env.CLAUDE_MODEL ?? "claude-sonnet-4-20250514";
+  const apiKeys = getAnthropicApiKeyCandidates();
+  if (apiKeys.length === 0) {
+    throw new Error("Claude API key is missing. Set ANTHROPIC_API_KEY or enable FORCE_MOCK_MODE=true.");
+  }
   const MAX_API_RETRIES = 6;
   const FETCH_TIMEOUT_MS = 300_000;
 
@@ -5836,82 +6860,93 @@ async function callLLMWithImages(prompt: string, imagePaths: string[], maxTokens
     });
   }
 
-  for (let apiAttempt = 1; apiAttempt <= MAX_API_RETRIES; apiAttempt++) {
-    let res: Response;
-    const controller = new AbortController();
-    const fetchTimer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-      res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: maxTokens,
-          system: LLM_SYSTEM,
-          messages: [{ role: "user", content: contentBlocks }],
-        }),
-        signal: controller.signal,
-      });
-    } catch (fetchErr: unknown) {
+  for (let keyIndex = 0; keyIndex < apiKeys.length; keyIndex++) {
+    const apiKey = apiKeys[keyIndex];
+
+    for (let apiAttempt = 1; apiAttempt <= MAX_API_RETRIES; apiAttempt++) {
+      let res: Response;
+      const controller = new AbortController();
+      const fetchTimer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      try {
+        res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model,
+            max_tokens: maxTokens,
+            system: LLM_SYSTEM,
+            messages: [{ role: "user", content: contentBlocks }],
+          }),
+          signal: controller.signal,
+        });
+      } catch (fetchErr: unknown) {
+        clearTimeout(fetchTimer);
+        const isAbort = fetchErr instanceof Error && fetchErr.name === "AbortError";
+        const msg = isAbort
+          ? `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s`
+          : fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+        if (apiAttempt < MAX_API_RETRIES) {
+          const waitSec = Math.min(5 * 2 ** (apiAttempt - 1), 30);
+          log("WARN", `Network error: ${msg}. Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
+          await sleep(waitSec * 1000);
+          continue;
+        }
+        throw new Error(`Network error after ${MAX_API_RETRIES} retries: ${msg}`);
+      }
       clearTimeout(fetchTimer);
-      const isAbort = fetchErr instanceof Error && fetchErr.name === "AbortError";
-      const msg = isAbort
-        ? `Request timed out after ${FETCH_TIMEOUT_MS / 1000}s`
-        : fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-      if (apiAttempt < MAX_API_RETRIES) {
-        const waitSec = Math.min(5 * 2 ** (apiAttempt - 1), 30);
-        log("WARN", `Network error: ${msg}. Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
-        await sleep(waitSec * 1000);
-        continue;
+
+      if (res.status === 429 || res.status === 529) {
+        const retryAfter = res.headers.get("retry-after");
+        const defaultWait = res.status === 529 ? 15 * (apiAttempt + 1) : 30 * apiAttempt;
+        const waitSec = retryAfter ? parseInt(retryAfter, 10) : defaultWait;
+        if (apiAttempt < MAX_API_RETRIES) {
+          const reason = res.status === 429 ? "Rate limited" : "API overloaded";
+          log("WARN", `${reason} (${res.status}). Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
+          await sleep(waitSec * 1000);
+          continue;
+        }
+        const body = await res.text();
+        throw new Error(`API ${res.status} after ${MAX_API_RETRIES} retries: ${body.slice(0, 500)}`);
       }
-      throw new Error(`Network error after ${MAX_API_RETRIES} retries: ${msg}`);
-    }
-    clearTimeout(fetchTimer);
 
-    if (res.status === 429 || res.status === 529) {
-      const retryAfter = res.headers.get("retry-after");
-      const defaultWait = res.status === 529 ? 15 * (apiAttempt + 1) : 30 * apiAttempt;
-      const waitSec = retryAfter ? parseInt(retryAfter, 10) : defaultWait;
-      if (apiAttempt < MAX_API_RETRIES) {
-        const reason = res.status === 429 ? "Rate limited" : "API overloaded";
-        log("WARN", `${reason} (${res.status}). Waiting ${waitSec}s before retry ${apiAttempt + 1}/${MAX_API_RETRIES}…`);
-        await sleep(waitSec * 1000);
-        continue;
+      if (!res.ok) {
+        const body = await res.text();
+        if (isClaudeAuthenticationError(res.status, body) && keyIndex + 1 < apiKeys.length) {
+          log("WARN", "Claude auth failed with current ANTHROPIC_API_KEY; retrying once with .env key.");
+          break;
+        }
+        throw new Error(`Claude API ${res.status}: ${body.slice(0, 500)}`);
       }
-      const body = await res.text();
-      throw new Error(`API ${res.status} after ${MAX_API_RETRIES} retries: ${body.slice(0, 500)}`);
+
+      const json = (await res.json()) as {
+        content?: { text?: string }[];
+        stop_reason?: string;
+      };
+      if (apiKey !== (process.env.ANTHROPIC_API_KEY?.trim() || "")) {
+        promoteWorkingAnthropicApiKey(apiKey);
+      }
+      const text = json.content?.[0]?.text ?? "";
+
+      if (json.stop_reason === "max_tokens") {
+        log("WARN", `Response truncated (hit max_tokens=${maxTokens}). Response length: ${text.length} chars`);
+        throw new Error(
+          `LLM response truncated at ${maxTokens} tokens. ` +
+          `Try reducing batch size or increasing max_tokens.`
+        );
+      }
+
+      const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (fenced) return JSON.parse(fenced[1].trim());
+
+      const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
+      if (raw) return JSON.parse(raw[1]);
+
+      throw new Error(`No JSON in LLM response: ${text.slice(0, 300)}`);
     }
-
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Claude API ${res.status}: ${body.slice(0, 500)}`);
-    }
-
-    const json = (await res.json()) as {
-      content?: { text?: string }[];
-      stop_reason?: string;
-    };
-    const text = json.content?.[0]?.text ?? "";
-
-    if (json.stop_reason === "max_tokens") {
-      log("WARN", `Response truncated (hit max_tokens=${maxTokens}). Response length: ${text.length} chars`);
-      throw new Error(
-        `LLM response truncated at ${maxTokens} tokens. ` +
-        `Try reducing batch size or increasing max_tokens.`
-      );
-    }
-
-    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (fenced) return JSON.parse(fenced[1].trim());
-
-    const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
-    if (raw) return JSON.parse(raw[1]);
-
-    throw new Error(`No JSON in LLM response: ${text.slice(0, 300)}`);
   }
 
   throw new Error("Claude API: exhausted all retries");
@@ -6087,119 +7122,36 @@ async function runVisualPolishPass(ctx: SharedContext): Promise<VisualReviewOutc
     }
   }
 
-  // UI/UX QA step - analyze layout and spacing issues
-  if (snapshot.screenshotPaths.length > 0) {
-    log("INFO", "Running UI/UX quality analysis…");
+  const assessment = await scoreVisualQuality(ctx, snapshot);
+  const thresholds = getVisualThresholds();
+  const blocked = assessment.severity !== "pass"
+    || assessment.desktopScore < thresholds.passDesktopScore
+    || assessment.mobileScore < thresholds.passMobileScore
+    || assessment.score < thresholds.passScore;
 
-    const uiQaPrompt = `Analyze these WordPress theme screenshots for UI/UX quality issues.
+  const artifacts = await writeVisualReviewReport(
+    ctx.workspacePath,
+    1,
+    assessment,
+    snapshot,
+    blocked ? "Visual gate blocked release; no blind CSS auto-patches were applied." : "Visual gate passed."
+  );
 
-Focus on:
-1. Layout spacing and consistency (padding, margin, gaps between elements)
-2. Typography hierarchy and readability
-3. Button and card alignment
-4. Modern design principles (whitespace, visual balance, contrast)
-5. Mobile responsiveness and touch targets
-6. User-friendliness and intuitive navigation
-
-For each issue found, provide:
-- Specific CSS selector or PHP template file location
-- Current problem description
-- Exact CSS fix with property values
-- Why this improves the user experience
-
-Format your response as a JSON array of fixes:
-[
-  {
-    "file": "style.css or template-file.php",
-    "selector": ".class-name or line reference",
-    "issue": "description of the problem",
-    "fix": "exact CSS code or PHP change",
-    "reason": "why this improves UX"
-  }
-]
-
-If the UI is already modern and user-friendly with no issues, return an empty array: []`;
-
-    try {
-      const qaResponse = await callLLMWithImages(uiQaPrompt, snapshot.screenshotPaths);
-
-      // callLLMWithImages returns parsed JSON directly
-      let fixes: Array<{
-        file: string;
-        selector: string;
-        issue: string;
-        fix: string;
-        reason: string;
-      }> = [];
-
-      if (Array.isArray(qaResponse)) {
-        fixes = qaResponse;
-      } else {
-        log("WARN", "UI/UX QA response is not an array");
-      }
-
-      if (fixes.length > 0) {
-        log("INFO", `Found ${fixes.length} UI/UX improvement(s)`);
-
-        // Apply fixes automatically
-        for (const fix of fixes) {
-          log("INFO", `Fixing: ${fix.issue}`);
-          log("INFO", `  Location: ${fix.file} ${fix.selector}`);
-          log("INFO", `  Reason: ${fix.reason}`);
-
-          const filePath = path.join(ctx.workspacePath, fix.file);
-
-          try {
-            const fileExists = await fs.access(filePath).then(() => true).catch(() => false);
-            if (!fileExists) {
-              log("WARN", `File not found: ${fix.file}, skipping fix`);
-              continue;
-            }
-
-            const content = await fs.readFile(filePath, "utf-8");
-
-            // For CSS files, append the fix
-            if (fix.file.endsWith(".css")) {
-              const updatedContent = content + "\n\n/* UI/UX improvement: " + fix.issue + " */\n" + fix.fix + "\n";
-              await fs.writeFile(filePath, updatedContent, "utf-8");
-              log("INFO", `Applied CSS fix to ${fix.file}`);
-            } else {
-              // For PHP files, log the fix for manual review
-              log("INFO", `PHP fix suggested for ${fix.file}:\n${fix.fix}`);
-            }
-          } catch (fileErr) {
-            log("WARN", `Could not apply fix to ${fix.file}: ${fileErr}`);
-          }
-        }
-
-        // Re-capture screenshots to verify improvements
-        log("INFO", "Re-capturing screenshots to verify improvements…");
-        try {
-          const verifySnapshot = await capturePreviewSnapshot(ctx.workspacePath);
-          if (verifySnapshot.screenshotPaths.length > 0) {
-            log("INFO", "Updated screenshots saved:");
-            for (const screenshotPath of verifySnapshot.screenshotPaths) {
-              log("INFO", `  • ${path.basename(screenshotPath)}`);
-            }
-            return {
-              blocked: false,
-              screenshotPaths: verifySnapshot.screenshotPaths,
-            };
-          }
-        } catch (verifyErr) {
-          log("WARN", `Could not re-capture screenshots: ${verifyErr}`);
-        }
-      } else {
-        log("INFO", "No UI/UX issues found - theme looks good!");
-      }
-    } catch (qaErr) {
-      log("WARN", `UI/UX QA failed: ${qaErr}`);
-    }
+  if (blocked) {
+    const issues = assessment.issues.length > 0 ? ` Issues: ${assessment.issues.join(" | ")}` : "";
+    return {
+      blocked: true,
+      reason: `Visual quality gate failed (${assessment.score}/${thresholds.passScore}, desktop ${assessment.desktopScore}/${thresholds.passDesktopScore}, mobile ${assessment.mobileScore}/${thresholds.passMobileScore}).${issues}`,
+      assessment,
+      artifacts,
+      screenshotPaths: snapshot.screenshotPaths,
+    };
   }
 
-  // Skip LLM visual scoring - just return success with screenshots
   return {
     blocked: false,
+    assessment,
+    artifacts,
     screenshotPaths: snapshot.screenshotPaths,
   };
 }
@@ -6247,9 +7199,205 @@ async function collectSourceSnippets(
   return snippets;
 }
 
+async function collectTextSnippets(
+  projectDir: string,
+  refs: Array<{ path: string; line?: number }>,
+  anchors: string[] = []
+): Promise<SourceSnippet[]> {
+  const merged = new Map<string, { path: string; line?: number }>();
+  for (const ref of refs) {
+    if (!ref.path) continue;
+    const existing = merged.get(ref.path);
+    if (!existing || (!existing.line && ref.line)) merged.set(ref.path, ref);
+  }
+  for (const anchor of anchors) {
+    if (!merged.has(anchor)) merged.set(anchor, { path: anchor });
+  }
+
+  const snippets: SourceSnippet[] = [];
+  for (const ref of merged.values()) {
+    try {
+      const abs = path.join(projectDir, ref.path);
+      const content = await fs.readFile(abs, "utf-8");
+      snippets.push({
+        path: ref.path,
+        content: excerptByLine(content, ref.line, 24),
+      });
+    } catch {
+      // skip unreadable files
+    }
+  }
+  return snippets;
+}
+
+function buildThemeRepairBatches(issues: ThemeContractIssue[]): ThemeRepairBatch[] {
+  const batches: ThemeRepairBatch[] = [];
+  const fileIssueMap = new Map<string, ThemeContractIssue[]>();
+
+  for (const issue of issues) {
+    const existing = fileIssueMap.get(issue.filePath) ?? [];
+    existing.push(issue);
+    fileIssueMap.set(issue.filePath, existing);
+  }
+
+  const sharedAnchors = ["functions.php", "header.php", "front-page.php"];
+  const styleIssues = issues.filter((issue) => issue.code === "missing-style-block");
+  if (styleIssues.length > 0) {
+    batches.push({
+      issues: styleIssues,
+      anchors: ["style.css"],
+    });
+  }
+
+  const themeDataIssues = issues.filter((issue) =>
+    issue.code === "data-schema-mismatch"
+      || issue.code === "missing-data-function"
+      || issue.code === "placeholder-asset"
+  );
+  if (themeDataIssues.length > 0) {
+    batches.push({
+      issues: themeDataIssues,
+      anchors: ["inc/theme-data.php", "style.css"],
+    });
+  }
+
+  const remainingIssueKeys = new Set(
+    [...styleIssues, ...themeDataIssues].map((issue) => `${issue.code}:${issue.filePath}:${issue.reason}`)
+  );
+
+  for (const [filePath, fileIssues] of fileIssueMap.entries()) {
+    const remaining = fileIssues.filter((issue) => !remainingIssueKeys.has(`${issue.code}:${issue.filePath}:${issue.reason}`));
+    if (remaining.length === 0) continue;
+
+    const anchors = new Set<string>(sharedAnchors);
+    if (remaining.some((issue) => issue.filePath.startsWith("template-parts/"))) {
+      anchors.add("inc/theme-data.php");
+      anchors.add("style.css");
+    }
+    batches.push({
+      issues: remaining,
+      anchors: [...anchors].filter((anchor) => anchor !== filePath),
+    });
+  }
+
+  return batches;
+}
+
+function splitThemeRepairBatch(batch: ThemeRepairBatch): ThemeRepairBatch[] {
+  const issuesByFile = new Map<string, ThemeContractIssue[]>();
+  for (const issue of batch.issues) {
+    const existing = issuesByFile.get(issue.filePath) ?? [];
+    existing.push(issue);
+    issuesByFile.set(issue.filePath, existing);
+  }
+
+  if (issuesByFile.size > 1) {
+    return [...issuesByFile.entries()].map(([filePath, issues]) => ({
+      issues,
+      anchors: batch.anchors.filter((anchor) => anchor !== filePath),
+    }));
+  }
+
+  if (batch.issues.length > 1) {
+    return batch.issues.map((issue) => ({
+      issues: [issue],
+      anchors: batch.anchors.filter((anchor) => anchor !== issue.filePath),
+    }));
+  }
+
+  return [];
+}
+
+async function applyThemeRepairBatch(
+  ctx: SharedContext,
+  phpPrefix: string,
+  batch: ThemeRepairBatch,
+  batchLabel: string,
+): Promise<string> {
+  const targetFiles = [...new Set(batch.issues.map((issue) => issue.filePath))];
+  const isSingleFileBatch = targetFiles.length === 1;
+  const anchorAllowList = new Set<string>();
+
+  if (isSingleFileBatch) {
+    const targetFile = targetFiles[0];
+    const issueCodes = new Set(batch.issues.map((issue) => issue.code));
+    if (targetFile.startsWith("template-parts/") && (issueCodes.has("data-schema-mismatch") || issueCodes.has("forbidden-helper"))) {
+      anchorAllowList.add("inc/theme-data.php");
+    }
+    if (issueCodes.has("missing-style-block")) {
+      anchorAllowList.add("style.css");
+    }
+  }
+
+  const effectiveAnchors = isSingleFileBatch
+    ? batch.anchors.filter((fp) => anchorAllowList.has(fp))
+    : batch.anchors;
+  const availableAnchors = effectiveAnchors.filter((fp) => existsSync(path.join(ctx.workspacePath, fp)));
+  const sourceFiles = await collectTextSnippets(
+    ctx.workspacePath,
+    batch.issues.map((issue) => ({ path: issue.filePath })),
+    availableAnchors
+  );
+
+  const targetFile = targetFiles[0] ?? "";
+  const repairMaxTokens = isSingleFileBatch
+    ? (targetFile === "inc/theme-data.php" || targetFile === "style.css" ? 16000 : 12000)
+    : 7000;
+
+  const prompt = `[FIX_THEME_CONTRACT]
+Fix WordPress theme contract violations before runtime validation.
+
+PHP prefix: ${phpPrefix}_
+Repair batch: ${batchLabel}
+
+ISSUES:
+${batch.issues.map((issue) => `- [${issue.code}] ${issue.filePath}: ${issue.reason}`).join("\n")}
+
+SOURCE SNIPPETS:
+${sourceFiles.map((file) => `=== ${file.path} ===\n${file.content}`).join("\n\n")}
+
+RULES:
+- Edit ONLY the files needed for the issues above.
+- functions.php may only include existing support files from this contract: inc/theme-data.php and inc/customizer.php.
+- inc/theme-data.php must define EXACTLY these data-access functions:
+  ${phpPrefix}_get_site_config(), ${phpPrefix}_get_products(), ${phpPrefix}_get_categories(), ${phpPrefix}_get_articles(), ${phpPrefix}_get_gallery()
+- template-parts may ONLY call those five functions.
+- Prefer fixing templates to consume site config or existing data arrays instead of inventing new helper functions.
+- DATA SHAPE RULE: every template part must use only keys that are explicitly defined in the matching data function inside inc/theme-data.php.
+- STYLE SYNC RULE: if a template uses a block class, style.css must define that block.
+- PLACEHOLDER ASSET RULE: remove loremflickr/picsum/placehold URLs; replace them with local SVG/CSS visuals or stable local assets.
+- VISUAL SAFETY RULE: keep hero and section layouts simple, readable, and mobile-first.
+- Return COMPLETE file contents for changed files only.
+
+Respond with JSON:
+{
+  "explanation": "what you fixed",
+  "files": [
+    { "path": "relative/path.ext", "content": "complete corrected file content" }
+  ]
+}`;
+
+  const fix = (await callLLM(prompt, repairMaxTokens)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
+  if (!fix.files || !Array.isArray(fix.files) || fix.files.length === 0) {
+    throw new Error(`Theme contract guard could not repair violations in batch ${batchLabel}`);
+  }
+
+  for (const file of fix.files) {
+    await writeFileSafe(ctx.workspacePath, file.path, file.content);
+  }
+
+  return fix.explanation ?? "updated files";
+}
+
 async function findThemeContractIssues(projectDir: string, phpPrefix: string): Promise<ThemeContractIssue[]> {
   const issues: ThemeContractIssue[] = [];
   const templatePartsDir = path.join(projectDir, "template-parts");
+  const themeDataPath = path.join(projectDir, "inc/theme-data.php");
+  const styleCssPath = path.join(projectDir, "style.css");
+  const allowedThemeIncludes = new Set([
+    "inc/theme-data.php",
+    "inc/customizer.php",
+  ]);
   const allowedFns = new Set([
     `${phpPrefix}_get_site_config`,
     `${phpPrefix}_get_products`,
@@ -6263,15 +7411,81 @@ async function findThemeContractIssues(projectDir: string, phpPrefix: string): P
     const functionsContent = await fs.readFile(functionsPath, "utf-8");
     if (/extends\s+Walker_Nav_Menu\b/.test(functionsContent) || /new\s+[A-Za-z0-9_]+_Walker_[A-Za-z0-9_]+\s*\(/.test(functionsContent)) {
       issues.push({
+        code: "forbidden-walker",
         filePath: "functions.php",
         reason: "Custom Walker_Nav_Menu usage is forbidden in preview-safe themes. Use wp_nav_menu() with a fallback menu and no custom walker.",
       });
+    }
+
+    for (const includeRef of extractStaticPhpIncludeReferences(functionsContent)) {
+      const includePath = includeRef.targetPath;
+      const absoluteIncludePath = path.join(projectDir, includePath);
+      if (!allowedThemeIncludes.has(includePath)) {
+        issues.push({
+          code: "forbidden-include",
+          filePath: "functions.php",
+          reason: `functions.php may only include theme support files declared in the theme contract. Found forbidden include: ${includePath}.`,
+        });
+      } else if (!existsSync(absoluteIncludePath)) {
+        issues.push({
+          code: "missing-include",
+          filePath: "functions.php",
+          reason: `functions.php includes ${includePath}, but that file does not exist. Remove the include or generate the file consistently.`,
+        });
+      }
+    }
+  }
+
+  const projectFiles = await listFilesSafe(projectDir);
+  for (const relPath of projectFiles) {
+    if (!relPath.endsWith(".php") || relPath === "functions.php" || relPath.startsWith("template-parts/")) {
+      continue;
+    }
+
+    try {
+      const content = await fs.readFile(path.join(projectDir, relPath), "utf-8");
+      for (const includeRef of extractStaticPhpIncludeReferences(content)) {
+        const absoluteIncludePath = path.join(projectDir, includeRef.targetPath);
+        if (!existsSync(absoluteIncludePath)) {
+          issues.push({
+            code: "missing-include",
+            filePath: relPath,
+            reason: `${relPath} references ${includeRef.targetPath}, but that file does not exist. Broken include: ${includeRef.statement}`,
+          });
+        }
+      }
+    } catch {
+      // Ignore unreadable files during contract scan.
+    }
+  }
+
+  if (!USE_MOCK) {
+    for (const relPath of projectFiles) {
+      if (!/\.(?:php|css|js)$/i.test(relPath)) {
+        continue;
+      }
+
+      try {
+        const content = await fs.readFile(path.join(projectDir, relPath), "utf-8");
+        const placeholderRefs = extractPlaceholderAssetReferences(content);
+        if (placeholderRefs.length > 0) {
+          issues.push({
+            code: "placeholder-asset",
+            filePath: relPath,
+            reason: `Placeholder asset URLs are not allowed in production themes. Replace these with local SVG/CSS visuals or stable real assets: ${placeholderRefs.slice(0, 3).join(", ")}.`,
+          });
+        }
+      } catch {
+        // Ignore unreadable files during placeholder asset scan.
+      }
     }
   }
 
   if (existsSync(templatePartsDir)) {
     const entries = await fs.readdir(templatePartsDir);
     const forbiddenPattern = new RegExp(`\\b(${escapeRegex(phpPrefix)}_get_[A-Za-z0-9_]+)\\s*\\(`, "g");
+    const themeDataContent = existsSync(themeDataPath) ? await fs.readFile(themeDataPath, "utf-8") : "";
+    const styleCssContent = existsSync(styleCssPath) ? await fs.readFile(styleCssPath, "utf-8") : "";
     for (const entry of entries) {
       if (!entry.endsWith(".php")) continue;
       const relPath = `template-parts/${entry}`;
@@ -6283,20 +7497,56 @@ async function findThemeContractIssues(projectDir: string, phpPrefix: string): P
         if (allowedFns.has(fnName) || seen.has(fnName)) continue;
         seen.add(fnName);
         issues.push({
+          code: "forbidden-helper",
           filePath: relPath,
           reason: `Template parts may only call the approved data functions. Found forbidden helper: ${fnName}().`,
+        });
+      }
+
+      const expectations = extractTemplateDataExpectations(content, phpPrefix);
+      for (const [functionName, expectedKeys] of expectations.entries()) {
+        const functionBlock = extractPhpFunctionBlock(themeDataContent, functionName);
+        if (!functionBlock) {
+          continue;
+        }
+
+        const missingKeys = [...expectedKeys].filter((key) => {
+          const keyPattern = new RegExp(`['"]${escapeRegex(key)}['"]\\s*=>`);
+          return !keyPattern.test(functionBlock);
+        });
+
+        if (missingKeys.length > 0) {
+          issues.push({
+            code: "data-schema-mismatch",
+            filePath: relPath,
+            reason: `${functionName}() does not define the keys used by this template part. Missing keys in inc/theme-data.php: ${missingKeys.join(", ")}.`,
+          });
+        }
+      }
+
+      const styleBlocks = extractTemplateStyleBlocks(content);
+      const missingBlocks = [...styleBlocks].filter((blockName) => {
+        const blockPattern = new RegExp(`\\.${escapeRegex(blockName)}(?:__|--|\\b)`);
+        return !blockPattern.test(styleCssContent);
+      });
+
+      if (missingBlocks.length > 0) {
+        issues.push({
+          code: "missing-style-block",
+          filePath: relPath,
+          reason: `style.css does not define selectors for template blocks used here: ${missingBlocks.join(", ")}.`,
         });
       }
     }
   }
 
-  const themeDataPath = path.join(projectDir, "inc/theme-data.php");
   if (existsSync(themeDataPath)) {
     const content = await fs.readFile(themeDataPath, "utf-8");
     const requiredFns = [...allowedFns];
     const missing = requiredFns.filter((fnName) => !new RegExp(`function\\s+${escapeRegex(fnName)}\\s*\\(`).test(content));
     if (missing.length > 0) {
       issues.push({
+        code: "missing-data-function",
         filePath: "inc/theme-data.php",
         reason: `Missing required data functions: ${missing.join(", ")}.`,
       });
@@ -6306,60 +7556,147 @@ async function findThemeContractIssues(projectDir: string, phpPrefix: string): P
   return issues;
 }
 
+async function findPluginContractIssues(ctx: SharedContext): Promise<ThemeContractIssue[]> {
+  const issues: ThemeContractIssue[] = [];
+  const spec = ctx.spec;
+  if (!spec) {
+    return issues;
+  }
+
+  const pluginMainFile = getPluginMainFileFromSpec(spec, ctx.analysis?.projectName);
+  const pluginMainPath = path.join(ctx.workspacePath, pluginMainFile);
+
+  if (!existsSync(pluginMainPath)) {
+    issues.push({
+      code: "missing-plugin-bootstrap",
+      filePath: pluginMainFile,
+      reason: `Plugin bootstrap file ${pluginMainFile} was planned but was not generated.`,
+    });
+    return issues;
+  }
+
+  const bootstrapContent = await fs.readFile(pluginMainPath, "utf-8");
+  if (!/^\s*<\?php/.test(bootstrapContent) || !/Plugin Name:/m.test(bootstrapContent)) {
+    issues.push({
+      code: "missing-plugin-header",
+      filePath: pluginMainFile,
+      reason: `Plugin bootstrap file ${pluginMainFile} must start with <?php and include a valid Plugin Name header.`,
+    });
+  }
+
+  const projectFiles = await listFilesSafe(ctx.workspacePath);
+  for (const relPath of projectFiles) {
+    if (!relPath.endsWith(".php")) {
+      continue;
+    }
+
+    try {
+      const content = await fs.readFile(path.join(ctx.workspacePath, relPath), "utf-8");
+      for (const includeRef of extractStaticPhpIncludeReferences(content)) {
+        const absoluteIncludePath = path.join(ctx.workspacePath, includeRef.targetPath);
+        if (!existsSync(absoluteIncludePath)) {
+          issues.push({
+            code: "missing-include",
+            filePath: relPath,
+            reason: `${relPath} references ${includeRef.targetPath}, but that file does not exist. Broken include: ${includeRef.statement}`,
+          });
+        }
+      }
+    } catch {
+      // Ignore unreadable files during contract scan.
+    }
+  }
+
+  return issues;
+}
+
+async function assertThemeGenerationHardChecks(ctx: SharedContext): Promise<void> {
+  const phpPrefix = (ctx.analysis?.projectName ?? "theme").replace(/-/g, "_");
+  const issues = await findThemeContractIssues(ctx.workspacePath, phpPrefix);
+  const blockingIssues = issues.filter((issue) =>
+    issue.code === "missing-include"
+      || issue.code === "forbidden-include"
+      || issue.code === "missing-data-function"
+      || issue.code === "data-schema-mismatch"
+      || issue.code === "missing-style-block"
+      || issue.code === "placeholder-asset"
+  );
+
+  logContractIssueSummary("Theme post-generation checks", issues);
+
+  if (blockingIssues.length === 0) {
+    return;
+  }
+
+  const summary = blockingIssues.map((issue) => `${issue.filePath}: ${issue.reason}`).join("\n");
+  throw new Error(
+    "Hard post-generation check failed: generated theme references missing required files.\n" + summary
+  );
+}
+
+async function assertPluginGenerationHardChecks(ctx: SharedContext): Promise<void> {
+  const issues = await findPluginContractIssues(ctx);
+  const blockingIssues = issues.filter((issue) =>
+    issue.code === "missing-include" || issue.code === "missing-plugin-bootstrap" || issue.code === "missing-plugin-header"
+  );
+
+  logContractIssueSummary("Plugin post-generation checks", issues);
+
+  if (blockingIssues.length === 0) {
+    return;
+  }
+
+  const summary = blockingIssues.map((issue) => `${issue.filePath}: ${issue.reason}`).join("\n");
+  throw new Error(
+    "Hard post-generation check failed: generated plugin has broken bootstrap/include references.\n" + summary
+  );
+}
+
 async function repairThemeContract(ctx: SharedContext): Promise<void> {
   if (USE_MOCK) return;
 
   const phpPrefix = (ctx.analysis?.projectName ?? "theme").replace(/-/g, "_");
-  const issues = await findThemeContractIssues(ctx.workspacePath, phpPrefix);
+  const MAX_REPAIR_PASSES = 3;
+  let issues = await findThemeContractIssues(ctx.workspacePath, phpPrefix);
   if (issues.length === 0) return;
 
-  log("WARN", `Theme contract guard found ${issues.length} issue(s)`);
-  for (const issue of issues) {
-    log("WARN", `  • ${issue.filePath}: ${issue.reason}`);
+  for (let pass = 1; pass <= MAX_REPAIR_PASSES && issues.length > 0; pass++) {
+    logContractIssueSummary(pass === 1 ? "Theme contract guard" : `Theme contract guard (pass ${pass})`, issues);
+
+    const initialBatches = buildThemeRepairBatches(issues);
+    const queue: Array<{ batch: ThemeRepairBatch; label: string }> = initialBatches.map((batch, index) => ({
+      batch,
+      label: `${pass}.${index + 1}/${initialBatches.length}`,
+    }));
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      try {
+        const explanation = await applyThemeRepairBatch(ctx, phpPrefix, current.batch, current.label);
+        log("INFO", `Theme contract repair batch ${current.label} applied: ${explanation}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const smallerBatches = msg.includes("truncated") ? splitThemeRepairBatch(current.batch) : [];
+        if (smallerBatches.length > 0) {
+          log("WARN", `Theme contract repair batch ${current.label} truncated — retrying in ${smallerBatches.length} smaller batch(es)`);
+          for (let index = smallerBatches.length - 1; index >= 0; index--) {
+            queue.unshift({
+              batch: smallerBatches[index],
+              label: `${current.label}.${index + 1}`,
+            });
+          }
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    issues = await findThemeContractIssues(ctx.workspacePath, phpPrefix);
   }
 
-  const sourceFiles = await collectSourceSnippets(
-    ctx.workspacePath,
-    issues.map((issue) => ({ path: issue.filePath })),
-    ["functions.php", "header.php", "inc/theme-data.php", "front-page.php"].filter((fp) => existsSync(path.join(ctx.workspacePath, fp)))
-  );
-
-  const prompt = `[FIX_THEME_CONTRACT]
-Fix WordPress theme contract violations before runtime validation.
-
-PHP prefix: ${phpPrefix}_
-
-ISSUES:
-${issues.map((issue) => `- ${issue.filePath}: ${issue.reason}`).join("\n")}
-
-SOURCE SNIPPETS:
-${sourceFiles.map((file) => `=== ${file.path} ===\n${file.content}`).join("\n\n")}
-
-RULES:
-- Remove any custom Walker_Nav_Menu classes/usages. Use wp_nav_menu() with a preview-safe fallback instead.
-- inc/theme-data.php must define EXACTLY these data-access functions:
-  ${phpPrefix}_get_site_config(), ${phpPrefix}_get_products(), ${phpPrefix}_get_categories(), ${phpPrefix}_get_articles(), ${phpPrefix}_get_gallery()
-- template-parts may ONLY call those five functions.
-- Prefer fixing templates to consume site config or existing data arrays instead of inventing new helper functions.
-- Return COMPLETE file contents for changed files only.
-
-Respond with JSON:
-{
-  "explanation": "what you fixed",
-  "files": [
-    { "path": "relative/path.php", "content": "complete corrected file content" }
-  ]
-}`;
-
-  const fix = (await callLLM(prompt, 12000)) as { explanation?: string; files?: Array<{ path: string; content: string }> };
-  if (!fix.files || !Array.isArray(fix.files) || fix.files.length === 0) {
-    throw new Error("Theme contract guard could not repair violations");
+  if (issues.length > 0) {
+    logContractIssueSummary("Theme contract guard (after repair)", issues);
   }
-
-  for (const file of fix.files) {
-    await writeFileSafe(ctx.workspacePath, file.path, file.content);
-  }
-  log("INFO", `Theme contract repair applied: ${fix.explanation ?? "updated files"}`);
 }
 
 /** Generate the .router.php content for PHP built-in server (WordPress stubs) */
@@ -6368,7 +7705,9 @@ function generateRouterContent(port: number): string {
 // Minimal router for PHP built-in server — simulates WordPress environment
 // Auto-stubs ANY undefined WordPress function so the theme can render without WP core
 
-error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED);
+error_reporting(E_ALL & ~E_DEPRECATED);
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
 define('ABSPATH', __DIR__ . '/');
 define('WPINC', 'wp-includes');
 define('TEMPLATEPATH', __DIR__);
@@ -6774,8 +8113,11 @@ async function runtimeCheck(projectDir: string): Promise<RuntimeCheckResult> {
 async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>> {
   const MAX_RETRIES = 5;
   const ws = ctx.workspacePath;
+  const isTheme = isThemeProject(ctx.analysis);
 
-  await repairThemeContract(ctx);
+  if (isTheme) {
+    await repairThemeContract(ctx);
+  }
 
   // Step 1: Validate PHP syntax for all PHP files
   log("INFO", "Validating PHP syntax…");
@@ -6810,6 +8152,10 @@ async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>
 
     if (allValid) {
       log("INFO", "All PHP files pass syntax check ✓");
+
+      if (!isTheme) {
+        return { success: true, data: lintOutput };
+      }
 
       // Step 2: runtime check — start PHP dev server and fetch pages
       let runtimeOk = false;
@@ -6853,7 +8199,7 @@ async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>
         }
 
         const rtFixPrompt = `[FIX_RUNTIME_ERROR]
-The WordPress theme has PHP errors when pages are loaded.
+      The WordPress theme has PHP errors when pages are loaded.
 
 Runtime errors:
 ${rt.errors.map((e, i) => `${i + 1}. ${e}`).join("\n\n")}
@@ -6873,6 +8219,7 @@ Common causes:
 RULES:
 - Fix the root cause, don't just suppress errors
 - DATA KEY FIX: If the error is "Cannot access offset of type string on string" or "Undefined array key", open inc/theme-data.php in the source files above and check the EXACT keys returned by each data function. Fix the template to use only those exact keys.
+- If a template does foreach ( $item['specs'] as ... ), then either make specs an associative array in inc/theme-data.php or change the template to render a scalar field. Never leave specs as a string when it is iterated.
 - Ensure all template parts are properly included via get_template_part()
 - Ensure all data functions are defined in inc/theme-data.php and loaded via functions.php
 - Use proper WordPress escaping
@@ -6934,8 +8281,9 @@ Respond with JSON:
     }
     log("DEBUG", `[FIX_BUILD] sending ${sourceFiles.length} file(s) to LLM (out of ${allFiles.length} total)`);
 
+    const packageLabel = isTheme ? "WordPress theme" : "WordPress plugin";
     const fixPrompt = `[FIX_BUILD]
-The following WordPress theme has PHP syntax errors. Analyze and provide fixed file contents.
+  The following ${packageLabel} has PHP syntax errors. Analyze and provide fixed file contents.
 
 PHP lint output:
 ${lintOutput}
@@ -7112,6 +8460,8 @@ async function generateIdeaMd(ctx: SharedContext): Promise<string> {
     "",
     "## 🎯 Project Overview",
     "",
+    `**Project Type:** ${getProjectTypeLabel(a.projectType)}`,
+    "",
     `**Target Audience:** ${a.targetAudience}`,
     "",
     "**Goals:**",
@@ -7244,22 +8594,34 @@ async function generateSpecMd(ctx: SharedContext): Promise<string> {
     .filter((f) => f.filePath.includes("template-parts/"))
     .map((f) => path.basename(f.filePath, path.extname(f.filePath)));
 
-  const diagram = [
-    "```",
-    "┌─────────────────────────────────────────────┐",
-    "│              WordPress Theme                │",
-    "│  header.php ──→ front-page.php ──→ footer   │",
-    "│  ┌──────────┐ ┌──────────┐ ┌──────────┐     │",
-    ...templateParts.map(
-      (name) => `│  │ ${name.padEnd(8).slice(0, 8)} │                              │`
-    ),
-    "│  └──────────┘ └──────────┘ └──────────┘     │",
-    "│                                             │",
-    "│  inc/ ──→ template-parts/ ──→ Page Templates│",
-    "│  functions.php ──→ Enqueue + Setup           │",
-    "└─────────────────────────────────────────────┘",
-    "```",
-  ];
+  const diagram = s.projectType === "wordpress_plugin"
+    ? [
+        "```",
+        "┌─────────────────────────────────────────────┐",
+        "│             WordPress Plugin                │",
+        "│  plugin.php ──→ includes/ ──→ admin/public  │",
+        "│                                             │",
+        "│  bootstrap ──→ loader ──→ hooked services   │",
+        "│  uninstall.php ──→ cleanup workflow         │",
+        "└─────────────────────────────────────────────┘",
+        "```",
+      ]
+    : [
+        "```",
+        "┌─────────────────────────────────────────────┐",
+        "│              WordPress Theme                │",
+        "│  header.php ──→ front-page.php ──→ footer   │",
+        "│  ┌──────────┐ ┌──────────┐ ┌──────────┐     │",
+        ...templateParts.map(
+          (name) => `│  │ ${name.padEnd(8).slice(0, 8)} │                              │`
+        ),
+        "│  └──────────┘ └──────────┘ └──────────┘     │",
+        "│                                             │",
+        "│  inc/ ──→ template-parts/ ──→ Page Templates│",
+        "│  functions.php ──→ Enqueue + Setup           │",
+        "└─────────────────────────────────────────────┘",
+        "```",
+      ];
 
   const lines = [
     `# Project Specification: ${a.projectName}`,
@@ -7533,7 +8895,7 @@ async function askAgentReview(ctx: SharedContext, kind: AgentKind): Promise<Revi
       ],
     };
 
-    const hasDevServer = kind === "build" || kind === "codegen";
+    const hasDevServer = isThemeProject(ctx.analysis) && (kind === "build" || kind === "codegen");
     const visualSummary = hasDevServer ? ctx.lastVisualReview : null;
 
     console.log("\n┌─────────────────────────────────────────────────────────┐");
@@ -7643,8 +9005,10 @@ async function applyCodeChange(ctx: SharedContext, feedback: string): Promise<vo
     }
   }
 
+  const packageLabel = getProjectTypeLabel(ctx.analysis?.projectType ?? inferProjectType(ctx.idea));
+
   const prompt = `[APPLY_CHANGE]
-The user is reviewing their WordPress theme and wants changes made.
+The user is reviewing their ${packageLabel} and wants changes made.
 
 User request: "${feedback}"
 
@@ -7665,11 +9029,11 @@ Respond with JSON:
 RULES:
 - Only include files that need to change — don't regenerate unchanged files
 - Return the COMPLETE file content (not a diff/patch)
-- This is a WordPress PHP theme — use proper escaping (esc_html, esc_attr, esc_url)
+- This is WordPress PHP code — use proper escaping (esc_html, esc_attr, esc_url)
 - Use i18n functions (__(), _e(), esc_html_e()) for translatable strings
-- If the user asks about style changes, modify the CSS in style.css or the relevant template-part
-- If the user asks about content changes, modify inc/theme-data.php or the template-part text
-- Keep the existing CSS custom properties and BEM class naming
+- If the user asks about style changes, modify the relevant CSS asset or theme stylesheet
+- If the user asks about content/data changes, modify the relevant data, template, or plugin view file
+- Preserve the existing architecture and WordPress hook usage
 - Do NOT break existing PHP includes or function calls
 - Do NOT introduce React, JSX, TypeScript, or Tailwind`;
 
@@ -7893,7 +9257,7 @@ async function orchestrate(idea: string, resumePath?: string): Promise<void> {
     }
 
     // ── Start dev server for live preview (after codegen or build) ───
-    const needsDevServer = agent.kind === "build" || agent.kind === "codegen";
+    const needsDevServer = isThemeProject(ctx.analysis) && (agent.kind === "build" || agent.kind === "codegen");
     if (needsDevServer) {
       // Ensure the router script exists for PHP preview
       const routerPath = path.join(ctx.workspacePath, ".router.php");
@@ -7948,6 +9312,7 @@ ${sourceFiles.map((file) => `=== ${file.path} ===\n${file.content}`).join("\n\n"
 COMMON FIXES:
 - "Call to undefined function X()" → function not defined or file not included via require_once
 - "Undefined array key" / "Cannot access offset of type string on string" → template is accessing a key that doesn't exist in the data function's return array. CHECK inc/theme-data.php for the exact array keys and fix the template to match.
+- If a template loops over specs, make sure specs is an associative array in inc/theme-data.php or stop iterating it.
 - "Undefined variable" → variable not initialized, check scope
 - Missing ABSPATH check → add if ( ! defined( 'ABSPATH' ) ) { exit; }
 - Wrong include path → use get_template_part() for template-parts/, require_once for inc/
@@ -8128,9 +9493,11 @@ RULES:
   stopDevServer();
   // Save final checkpoint
   await saveCheckpoint(ctx, agents.length - 1, completedAgents);
+  const uploadZipPath = await createUploadReadyPackageZip(projectDir, ctx.analysis);
   console.log(`\n${"═".repeat(60)}`);
   console.log("  ✅ Pipeline completed successfully!");
   console.log(`  📁 Project: ${projectDir}`);
+  console.log(`  📦 Upload ZIP: ${uploadZipPath}`);
   console.log(`  🔄 Resume:  node dist/agent.js --resume ${projectDir}`);
   console.log(`${"═".repeat(60)}\n`);
 }
@@ -8198,6 +9565,7 @@ Environment:
   LOG_LEVEL           DEBUG | INFO | WARN | ERROR
   AUTO_APPROVE        "true" to skip approval prompts
   OUTPUT_DIR          Root for generated projects (default: ./output)
+  FORCE_MOCK_MODE     "true" to force mock mode even if .env contains an API key
 `);
     return;
   }

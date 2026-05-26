@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "build": "tsc",
-    "start": "node dist/agent.js"
+    "start": "node dist/agent.js",
+    "test:hard-checks": "npm run build && node scripts/test-hard-checks.mjs"
   },
   "engines": {
     "node": ">=18.0.0"
