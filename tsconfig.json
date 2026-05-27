@@ -13,5 +13,5 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["agent.ts"]
+  "include": ["agent.ts", "src/**/*.ts", "skills/**/*.ts"]
 }

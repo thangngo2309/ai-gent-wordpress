@@ -26,6 +26,19 @@ import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { execSync, spawn, exec, ChildProcess } from "node:child_process";
 
+// ─── New skill/module imports (incremental refactor) ──────────────────────────
+import {
+  WORDPRESS_PRODUCTION_SYSTEM_PROMPT as WP_SYSTEM_PROMPT_V2,
+  LLM_SYSTEM as LLM_SYSTEM_V2,
+} from "./src/prompts/wordpress-system.js";
+import { phpcsSkill } from "./skills/validation/phpcs.skill.js";
+import { phpstanSkill } from "./skills/validation/phpstan.skill.js";
+import { wpStandardSkill } from "./skills/validation/wp-standard.skill.js";
+import { wordpressValidatorSkill } from "./skills/wordpress/validator.skill.js";
+import { wooSkill } from "./skills/wordpress/woo.skill.js";
+import { runHealthChecks, printHealthReport } from "./src/health/checks.js";
+// ─────────────────────────────────────────────────────────────────────────────
+
 const APP_ENV_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_MODEL", "LOG_LEVEL", "AUTO_APPROVE", "OUTPUT_DIR"] as const;
 let loadedDotenvValues: Partial<Record<(typeof APP_ENV_KEYS)[number], string>> = {};
 
@@ -401,6 +414,65 @@ async function createUploadReadyPackageZip(projectDir: string, analysis: Feature
   return zipPath;
 }
 
+async function createPlaygroundBlueprint(projectDir: string, analysis: FeatureAnalysis | null): Promise<string> {
+  const slug = await getUploadPackageSlug(projectDir, analysis);
+  const isTheme = isThemeProject(analysis);
+  const projectName = analysis?.projectName ?? slug;
+  const description = analysis?.projectType === "wordpress_plugin"
+    ? `Plugin: ${projectName}`
+    : `Theme: ${projectName}`;
+
+  const steps: unknown[] = [
+    { step: "login", username: "admin", password: "password" },
+  ];
+
+  if (isTheme) {
+    steps.push({ step: "activateTheme", themeFolderName: slug });
+    // Create front page, nav menu, and set site options
+    steps.push({
+      step: "runPHP",
+      code: `<?php
+require('/wordpress/wp-load.php');
+// Front page
+$page_id = wp_insert_post([
+  'post_title'   => 'Trang Chủ',
+  'post_status'  => 'publish',
+  'post_type'    => 'page',
+  'post_content' => '',
+]);
+if ( ! is_wp_error( $page_id ) && $page_id ) {
+  update_option( 'page_on_front', $page_id );
+}
+update_option( 'show_on_front', 'page' );
+update_option( 'blogname', ${JSON.stringify(projectName)} );
+update_option( 'blogdescription', ${JSON.stringify(description)} );
+// Primary navigation menu
+$menu_id = wp_create_nav_menu( 'Primary Menu' );
+if ( ! is_wp_error( $menu_id ) ) {
+  wp_update_nav_menu_item( $menu_id, 0, [ 'menu-item-title' => 'Trang Chủ', 'menu-item-url' => home_url( '/' ), 'menu-item-status' => 'publish', 'menu-item-type' => 'custom' ] );
+  wp_update_nav_menu_item( $menu_id, 0, [ 'menu-item-title' => 'Sản Phẩm', 'menu-item-url' => home_url( '/#san-pham' ), 'menu-item-status' => 'publish', 'menu-item-type' => 'custom' ] );
+  wp_update_nav_menu_item( $menu_id, 0, [ 'menu-item-title' => 'Liên Hệ', 'menu-item-url' => home_url( '/#lien-he' ), 'menu-item-status' => 'publish', 'menu-item-type' => 'custom' ] );
+  $locations = get_theme_mod( 'nav_menu_locations', [] );
+  $locations['primary'] = $menu_id;
+  set_theme_mod( 'nav_menu_locations', $locations );
+}
+?>`,
+    });
+  } else {
+    steps.push({ step: "activatePlugin", pluginPath: `${slug}/${slug}.php` });
+  }
+
+  const blueprint = {
+    $schema: "https://playground.wordpress.net/blueprint-schema.json",
+    preferredVersions: { php: "8.3", wp: "latest" },
+    steps,
+  };
+
+  const blueprintPath = path.join(projectDir, "playground-blueprint.json");
+  await fs.writeFile(blueprintPath, JSON.stringify(blueprint, null, 2), "utf-8");
+  return blueprintPath;
+}
+
 async function readFileSafe(ws: string, fp: string): Promise<string> {
   return fs.readFile(resolveSafe(ws, fp), "utf-8");
 }
@@ -508,6 +580,9 @@ Choose a cohesive color palette that matches the user's topic. Include:
 - Use @keyframes for animations (fade-in, slide-up, slide-in-left)
 - Media queries for responsive: mobile-first approach
 - Image wrappers must have overflow: hidden; images must have height + object-fit: cover to prevent layout shift
+- ⚠️  CARD IMAGE ASPECT RATIO: Use \`aspect-ratio: 4/3\` (or \`aspect-ratio: 16/9\` for wide cards) on card image containers instead of a fixed \`height: 120px\`. This lets content scale proportionally and avoids clipping.
+- ⚠️  INLINE SVG IN CARD IMAGE: If the card-image container contains an inline \`<svg>\` child, do NOT add a \`::before\` pseudo-element background placeholder — the SVG IS the visual. The container must have \`overflow: hidden; display: flex; align-items: center; justify-content: center;\` and the \`<svg>\` child must have \`width: 100%; height: 100%; display: block;\`. Write a specific CSS rule \`.section-X__card-svg { width: 100%; height: 100%; display: block; }\` for every inline-SVG card image.
+- ⚠️  HERO VISUAL DEPTH: Hero visual panel backgrounds and \`::before\` pseudo-element SVG overlays must use \`opacity: 1\` (not \`opacity: 0.3\`) for the illustration to be clearly visible. Apply \`opacity\` only to secondary decorative shapes, not the primary visual.
 - ⚠️  FIXED HEADER OFFSET: If .site-header uses position: fixed or position: sticky, body MUST have padding-top equal to the header height (e.g. \`body { padding-top: var(--header-height, 80px); }\`). Add \`--header-height: 80px\` to :root.
 - ⚠️  WORDPRESS ADMIN BAR: Logged-in WordPress previews include #wpadminbar. If the header is fixed, offset .site-header and body padding correctly for .admin-bar so the top of the page does not show a blank strip or clipped header.
 - ⚠️  CSS–PHP CLASS SYNC: Every CSS selector you write (.section-about__stats-cards, .section-categories__grid, etc.) MUST exactly match the \`class="..."\` attribute used in the corresponding PHP template. Do NOT define \`.categories-grid\` if the PHP template uses \`class="section-categories__grid"\`. Write CSS classes to match PHP, or write PHP to match CSS — but they MUST be identical.
@@ -620,6 +695,8 @@ a { text-decoration: none; color: inherit; }
 10. **Dark overlays on images**: Use pseudo-elements or gradient overlays for text readability
 11. **Avoid AI-slop defaults**: No generic SaaS hero, no purple-on-white default palette, no full-page stock-photo dependency, no oversized glassmorphism everywhere.
 12. **Mobile behavior**: On mobile, CTA buttons must remain visible without overlap, floating badges/cards must reflow or hide, and section headings should not be pushed far below the fold.
+13. **Card image sizing**: Product/category/article card image areas must use \`aspect-ratio: 4/3\` or \`aspect-ratio: 3/2\` — never a naked \`height: NNpx\` without aspect-ratio. This prevents empty gaps when cards have varying content lengths.
+14. **Rich card visuals**: Product card image areas must feel rich and branded, not like empty placeholders. Use gradients, colour blocks, and illustrated SVGs that fill the full card-image area. The card-image background colour must use primary/secondary palette vars, not grey muted tones.
 
 ### Page Sections (create each as a template-part)
 1. **Header** — Sticky nav with glass effect, logo, wp_nav_menu, CTA button (header.php)
@@ -799,51 +876,11 @@ function isClaudeAuthenticationError(status: number, body: string): boolean {
   return status === 401 && /authentication_error|invalid x-api-key/i.test(body);
 }
 
-const WORDPRESS_PRODUCTION_SYSTEM_PROMPT = `You are a senior WordPress developer specialized in:
-- WordPress Themes
-- WordPress Plugins
-- WooCommerce
-- Gutenberg
-- Elementor compatibility
-- SEO optimization
-- WordPress Coding Standards
-- WordPress security best practices
-
-Your task is to generate production-ready WordPress code.
-
-CRITICAL RULES:
-- Never generate plain PHP applications.
-- Always follow WordPress architecture.
-- Generate upload-ready WordPress themes/plugins.
-- Follow WordPress Coding Standards.
-- Use WordPress APIs whenever possible.
-- Use hooks/actions/filters correctly.
-- Use wp_enqueue_script/style.
-- Sanitize and escape all user data.
-- Use nonce verification for forms.
-- Never directly trust $_POST, $_GET.
-- Use translation-ready functions (__ and _e).
-- Generate responsive layouts when UI is involved.
-- Generate SEO-friendly HTML structure.
-- Support latest WordPress version.
-- Support WooCommerce if ecommerce requested.
-- Use semantic HTML.
-- Avoid inline CSS and JS.
-- Separate logic and presentation.
-- Generate complete file structure.
-- Generate code that works immediately after installation.
-- Never generate malicious WordPress code.
-- Never generate obfuscated PHP.
-- Never use eval().`;
-
-const LLM_SYSTEM =
-  WORDPRESS_PRODUCTION_SYSTEM_PROMPT +
-  " Respond ONLY with valid JSON — no markdown fences, no prose explanations outside the JSON. " +
-  "Return the raw JSON object or array directly. " +
-  "When generating CSS: (1) every var(--X) reference must have a matching :root declaration in the same style.css, " +
-  "(2) transition/animation rules must be inside @media (prefers-reduced-motion: no-preference) blocks, " +
-  "(3) never use bare hex colors for text or backgrounds — always use CSS custom properties. " +
-  "When generating PHP: every template or bootstrap file must start with <?php, use WordPress hooks/APIs, check ABSPATH where appropriate, and use WordPress escaping functions.";
+// Use the enhanced system prompts from src/prompts/wordpress-system.ts
+// The legacy constants below are kept as fallback aliases for places in this file
+// that still reference them by name.
+const WORDPRESS_PRODUCTION_SYSTEM_PROMPT = WP_SYSTEM_PROMPT_V2;
+const LLM_SYSTEM = LLM_SYSTEM_V2;
 
 async function callLLM(prompt: string, maxTokens = 16384): Promise<unknown> {
   log("DEBUG", `LLM call (${USE_MOCK ? "MOCK" : "LIVE"}) — prompt ${prompt.length} chars, maxTokens ${maxTokens}`);
@@ -6103,7 +6140,8 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
               const isStyleSheet = f.filePath === "style.css";
               const isThemeData = f.filePath.includes("inc/") || f.filePath.includes("theme-data");
               const isTemplatePart = f.filePath.includes("template-parts/");
-              const limit = isStyleSheet ? 4000 : isThemeData ? 3000 : isTemplatePart ? 1500 : 800;
+              const isFunctions = f.filePath === "functions.php";
+              const limit = isStyleSheet ? 4000 : isThemeData ? 3000 : isTemplatePart ? 1500 : isFunctions ? 4000 : 800;
               return `--- ${f.filePath} ---\n${f.content.slice(0, limit)}${f.content.length > limit ? "\n…(truncated)" : ""}`;
             }).join("\n")}\n`
           : "";
@@ -6118,6 +6156,14 @@ async function codeGenerator(ctx: SharedContext): Promise<AgentResult<GeneratedF
         const compact = varNames.join(", ");
         const capped = compact.length > 1500 ? compact.slice(0, 1500) + "…" : compact;
         return `\n⚠️  CSS variables defined in style.css (use ONLY these — never invent new var names):\n${capped}\n`;
+      })();
+
+      const definedFunctionsBlock = (() => {
+        const functionsPhp = seedFiles.find((f) => f.filePath === "functions.php");
+        if (!functionsPhp) return "";
+        const fnNames = [...functionsPhp.content.matchAll(/^function\s+(\w+)\s*\(/gm)].map((m) => m[1]);
+        if (fnNames.length === 0) return "";
+        return `\n⚠️  PHP functions already defined in functions.php — NEVER redefine these in header.php, footer.php, or any template file:\n${fnNames.join(", ")}\n`;
       })();
 
       const dataContractBlock = (() => {
@@ -6181,7 +6227,7 @@ Full project file list: ${allPlanned.map((f) => f.filePath).join(", ")}
 - When imagery is needed, use local SVG files under assets/images/ or CSS/inline SVG visual treatments that do not require external network fetches.
 
 ${designSystemForBatch}
-${cssVarsBlock}${dataContractBlock}${templateStyleBlocksBlock}${existingContext}
+${cssVarsBlock}${definedFunctionsBlock}${dataContractBlock}${templateStyleBlocksBlock}${existingContext}
 Generate ONLY these files (batch ${batchIdx + 1}/${batches.length}):
 ${fileList}
 
@@ -6213,6 +6259,9 @@ CRITICAL rules (violating these causes errors):
 - NAV CONTRACT: if functions.php registers a menu location 'primary', header.php MUST render wp_nav_menu() with theme_location => 'primary'.
   Never register 'primary' and render 'menu-primary' or any other mismatched slug.
 - PREVIEW-SAFE NAV: header.php must provide a non-empty fallback menu when no WordPress menu is assigned so the local PHP router preview still renders the intended layout.
+- FUNCTION SCOPE: NEVER define PHP functions inside header.php, footer.php, front-page.php, or any template-parts/*.php file.
+  ALL helper functions (including wp_nav_menu fallback_cb callbacks) MUST be defined exclusively in functions.php or inc/*.php files.
+  If a function is already listed in the ⚠️ defined-functions block above, do NOT redeclare it anywhere.
 - Use get_theme_mod() for Customizer settings
 - inc/theme-data.php MUST define EXACTLY these 5 functions (no more, no fewer):
     ${actualPrefix}_get_site_config(), ${actualPrefix}_get_products(), ${actualPrefix}_get_categories(), ${actualPrefix}_get_articles(), ${actualPrefix}_get_gallery()
@@ -6280,6 +6329,10 @@ WOOCOMMERCE RULES (default OFF):
 14. Hero layout remains readable at 390px width: no overlapping floating cards, no clipped CTAs, no multi-column text blocks on mobile.
 15. Editorial, categories, and gallery sections use concise demo content and do not dump oversized paragraphs or mismatched nested data structures into cards.
 16. No generated file contains remote placeholder-image URLs such as loremflickr, picsum, dummyimage, or placehold.
+17. No PHP function is defined inside header.php, footer.php, front-page.php, or template-parts/*.php. All functions live in functions.php or inc/*.php only.
+18. Every \`.section-X__card-image\` that contains an inline \`<svg>\` child has a matching CSS rule \`.section-X__card-svg { width: 100%; height: 100%; display: block; }\` and has NO conflicting \`::before\` pseudo-element placeholder on the same container.
+19. Hero \`::before\`/\`::after\` decorative pseudo-elements on the visual panel use \`opacity: 0.15\` or lower for texture — the primary illustration (inline SVG or gradient) is fully visible without being washed out by an overlay.
+20. Card image containers use \`aspect-ratio\` (not just fixed \`height\`) so they scale correctly at all viewport widths.
 
 Return ONLY the ${batch.length} file(s) listed above` : `[GENERATE_CODE]
 ${WORDPRESS_PRODUCTION_SYSTEM_PROMPT}
@@ -6333,7 +6386,7 @@ Return ONLY the ${batch.length} file(s) listed above`;
 
       log("INFO", `Batch ${batchIdx + 1}/${batches.length}: generating ${batch.map((f) => f.filePath).join(", ")}`);
 
-      const batchMaxTokens = batchHasCss ? 32000 : 16384;
+      const batchMaxTokens = 32000;
 
       try {
         return (await callLLM(prompt, batchMaxTokens)) as GeneratedFile[];
@@ -6350,7 +6403,7 @@ Return ONLY the ${batch.length} file(s) listed above`;
                 `Return ONLY 1 file: ${singleFile.filePath}`);
             log("INFO", `  Retrying individually: ${singleFile.filePath}`);
             try {
-              const singleResult = (await callLLM(singlePrompt, 16384)) as GeneratedFile[] | GeneratedFile;
+              const singleResult = (await callLLM(singlePrompt, 32000)) as GeneratedFile[] | GeneratedFile;
               const files = Array.isArray(singleResult) ? singleResult : [singleResult];
               retried.push(...files);
             } catch (singleErr: unknown) {
@@ -8153,6 +8206,71 @@ async function buildAndFixAgent(ctx: SharedContext): Promise<AgentResult<string>
     if (allValid) {
       log("INFO", "All PHP files pass syntax check ✓");
 
+      // ── Enhanced validation via new skill modules ───────────────────────
+      const genCtx = {
+        workspacePath: ws,
+        projectSlug: (ctx as SharedContext & { projectSlug?: string }).projectSlug ?? "project",
+        phpPrefix: (ctx as SharedContext & { phpPrefix?: string }).phpPrefix ?? "theme",
+        analysis: ctx.analysis,
+        spec: ctx.spec,
+        idea: ctx.idea,
+        generatedFiles: ctx.generatedFiles,
+        remoteLlmCallCount: 0,
+      };
+
+      // WP Coding Standards check (deterministic, no external tools needed)
+      try {
+        const wpStdResult = await wpStandardSkill.execute(undefined, genCtx);
+        const wpStdErrors = wpStdResult.data?.violations.filter((v) => v.severity === "error") ?? [];
+        if (wpStdErrors.length > 0) {
+          log("WARN", `WP Standards: ${wpStdErrors.length} error(s) found`);
+          ctx.buildLogs.push(wpStdErrors.map((e) => `${e.file}: ${e.message}`).join("\n"));
+        } else {
+          log("INFO", "WP Standards check ✓");
+        }
+      } catch (e) {
+        log("WARN", `WP Standards check failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      // PHPCS (if installed)
+      try {
+        const phpcsResult = await phpcsSkill.execute({ standard: "WordPress", autoFix: true }, genCtx);
+        if (phpcsResult.data?.available) {
+          const errors = phpcsResult.data.violations.filter((v) => v.severity === "error").length;
+          log("INFO", `PHPCS: ${errors} error(s), auto-fixed: ${phpcsResult.data.autoFixed}`);
+          if (errors > 0) ctx.buildLogs.push(`PHPCS errors: ${phpcsResult.data.rawOutput.slice(0, 2000)}`);
+        }
+      } catch (e) {
+        log("DEBUG", `PHPCS check skipped: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      // WordPress composite validator (hooks, enqueue, security, i18n, quality score)
+      try {
+        const wpValidResult = await wordpressValidatorSkill.execute(undefined, genCtx);
+        log("INFO", `WP Validator quality score: ${wpValidResult.data?.score ?? "N/A"}/100`);
+        if ((wpValidResult.data?.structureErrors.length ?? 0) > 0) {
+          ctx.buildLogs.push(`WP Validator: ${wpValidResult.data?.structureErrors.join("; ")}`);
+        }
+      } catch (e) {
+        log("DEBUG", `WP Validator skipped: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      // WooCommerce compatibility (only when relevant)
+      const needsWoo = /woocommerce|woo\b|e-?commerce|shop|store|cart|checkout/i.test(ctx.idea ?? "");
+      if (needsWoo) {
+        try {
+          const wooResult = await wooSkill.execute(undefined, genCtx);
+          if (!wooResult.data?.compatible) {
+            log("WARN", `WooCommerce compatibility issues: ${wooResult.data?.issues.join(", ")}`);
+          } else {
+            log("INFO", "WooCommerce compatibility ✓");
+          }
+        } catch (e) {
+          log("DEBUG", `WooCommerce check skipped: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
       if (!isTheme) {
         return { success: true, data: lintOutput };
       }
@@ -9494,10 +9612,17 @@ RULES:
   // Save final checkpoint
   await saveCheckpoint(ctx, agents.length - 1, completedAgents);
   const uploadZipPath = await createUploadReadyPackageZip(projectDir, ctx.analysis);
+  const blueprintPath = await createPlaygroundBlueprint(projectDir, ctx.analysis);
+  const themeSlug = await getUploadPackageSlug(projectDir, ctx.analysis);
   console.log(`\n${"═".repeat(60)}`);
   console.log("  ✅ Pipeline completed successfully!");
   console.log(`  📁 Project: ${projectDir}`);
   console.log(`  📦 Upload ZIP: ${uploadZipPath}`);
+  console.log(`  🧩 Playground:`);
+  console.log(`     npx @wp-playground/cli@latest server \\`);
+  console.log(`       --mount=${projectDir}:/wordpress/wp-content/themes/${themeSlug} \\`);
+  console.log(`       --blueprint=${blueprintPath} \\`);
+  console.log(`       --port=9401`);
   console.log(`  🔄 Resume:  node dist/agent.js --resume ${projectDir}`);
   console.log(`${"═".repeat(60)}\n`);
 }
@@ -9567,6 +9692,15 @@ Environment:
   OUTPUT_DIR          Root for generated projects (default: ./output)
   FORCE_MOCK_MODE     "true" to force mock mode even if .env contains an API key
 `);
+    return;
+  }
+
+  // ── Health check ─────────────────────────────────────────────────
+  const healthReport = runHealthChecks();
+  printHealthReport(healthReport);
+  if (!healthReport.healthy) {
+    console.error("Required tools are missing. Please fix the errors above before continuing.");
+    process.exitCode = 1;
     return;
   }
 
