@@ -3,10 +3,11 @@
  *
  * High-level pipeline that coordinates:
  *   1. RAG context retrieval
- *   2. Theme or plugin skill execution (code generation)
- *   3. Hooks + enqueue validation
- *   4. Full validation pipeline
- *   5. ZIP export
+ *   2. UI design system context injection
+ *   3. Theme or plugin skill execution (code generation)
+ *   4. Hooks + enqueue validation
+ *   5. Full validation pipeline
+ *   6. ZIP export
  *
  * This pipeline can be invoked from agent.ts or standalone.
  */
@@ -17,6 +18,8 @@ import { wooCommerceRagSkill } from "../../skills/rag/woocommerce-rag.skill.js";
 import { themeSkill } from "../../skills/wordpress/theme.skill.js";
 import { pluginSkill } from "../../skills/wordpress/plugin.skill.js";
 import { zipSkill } from "../../skills/wordpress/zip.skill.js";
+import { premiumUiSkill } from "../../skills/ui/premium-ui.skill.js";
+import { designSystemSkill } from "../../skills/ui/design-system.skill.js";
 import { runValidationPipeline, type ValidationPipelineResult } from "./validation.pipeline.js";
 import { createLogger } from "../core/logger.js";
 
@@ -28,6 +31,7 @@ export interface GenerationPipelineResult {
   zipPath: string | null;
   validationReport: ValidationPipelineResult | null;
   ragContextInjected: boolean;
+  uiContextInjected: boolean;
   durationMs: number;
 }
 
@@ -54,7 +58,31 @@ export async function runGenerationPipeline(
   const ragContextInjected = ragContext.length > 0;
   if (ragContextInjected) genCtx.ragContext = ragContext;
 
-  // 2. Generate theme or plugin
+  // 2. Inject UI design system context (themes only — plugins skip UI layer)
+  let uiContextInjected = false;
+  if (!isPlugin) {
+    try {
+      const [uiResult, dsResult] = await Promise.all([
+        premiumUiSkill.execute({ includeEcommerce: needsWoo }, genCtx),
+        designSystemSkill.execute({ idea }, genCtx),
+      ]);
+
+      if (uiResult.success) {
+        genCtx.uiPromptBlock = uiResult.data.uiBlock;
+        uiContextInjected = true;
+        log.info(`UI context injected (ecommerce: ${uiResult.data.includesEcommerce})`);
+      }
+      if (dsResult.success) {
+        genCtx.designSystemCssVars = dsResult.data.cssVars;
+        log.info("Design system CSS vars injected");
+      }
+    } catch (e) {
+      // Non-blocking — continue without UI context if skill fails
+      log.warn(`UI skill injection failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // 3. Generate theme or plugin
   log.info(`Generating ${isPlugin ? "plugin" : "theme"}…`);
 
   const fileStructure = genCtx.spec?.fileStructure ?? [];
@@ -70,7 +98,7 @@ export async function runGenerationPipeline(
 
   log.info(`Generated ${filesGenerated} file(s)`);
 
-  // 3. Validate
+  // 4. Validate
   log.info("Running validation…");
   let validationReport: ValidationPipelineResult | null = null;
   try {
@@ -80,7 +108,7 @@ export async function runGenerationPipeline(
     log.error(`Validation pipeline error: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // 4. ZIP export
+  // 5. ZIP export
   log.info("Building ZIP archive…");
   let zipPath: string | null = null;
   try {
@@ -100,6 +128,7 @@ export async function runGenerationPipeline(
     zipPath,
     validationReport,
     ragContextInjected,
+    uiContextInjected,
     durationMs: Date.now() - start,
   };
 }

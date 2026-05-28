@@ -195,6 +195,10 @@ export interface GenerationContext {
   phpPrefix: string;
   /** Optional RAG context injected by the RAG skill */
   ragContext?: string;
+  /** Premium UI prompt block injected by the UI skills layer */
+  uiPromptBlock?: string;
+  /** Design system CSS custom properties seeded by the design-system skill */
+  designSystemCssVars?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

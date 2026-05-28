@@ -155,7 +155,10 @@ export class ThemeSkill extends BaseSkill<ThemeSkillInput, ThemeSkillOutput> {
     // Seed batches run sequentially so subsequent batches have context
     for (let i = 0; i < batches.length; i++) {
       const batch = batches[i];
-      const cssVarsBlock = extractCssVarsBlock(allFiles);
+      // Use design system CSS vars from context as the seed for early batches
+      // (before style.css is generated).  extractCssVarsBlock returns "" until
+      // style.css lands in allFiles, so ctx.designSystemCssVars fills the gap.
+      const cssVarsBlock = extractCssVarsBlock(allFiles) || ctx.designSystemCssVars || "";
       const existingContext = buildExistingContext(allFiles);
 
       const prompt = buildThemeBatchPrompt(

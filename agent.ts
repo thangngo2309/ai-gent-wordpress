@@ -37,6 +37,7 @@ import { wpStandardSkill } from "./skills/validation/wp-standard.skill.js";
 import { wordpressValidatorSkill } from "./skills/wordpress/validator.skill.js";
 import { wooSkill } from "./skills/wordpress/woo.skill.js";
 import { runHealthChecks, printHealthReport } from "./src/health/checks.js";
+import { buildQaMasterPrompt } from "./skills/qa/qa-master.skill.js";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const APP_ENV_KEYS = ["ANTHROPIC_API_KEY", "CLAUDE_MODEL", "LOG_LEVEL", "AUTO_APPROVE", "OUTPUT_DIR"] as const;
@@ -882,6 +883,93 @@ function isClaudeAuthenticationError(status: number, body: string): boolean {
 const WORDPRESS_PRODUCTION_SYSTEM_PROMPT = WP_SYSTEM_PROMPT_V2;
 const LLM_SYSTEM = LLM_SYSTEM_V2;
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  JSON REPAIR — handles unescaped double-quotes inside LLM-generated content
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sanitizes common LLM JSON output failures before calling JSON.parse.
+ *
+ * The most frequent failure mode for code-generation batches:
+ *   LLM writes CSS `content: "•"` or PHP `$x = "value"` literally inside the
+ *   JSON "content" string value without escaping the inner double-quotes,
+ *   producing invalid JSON like: `"content": "foo "bar" baz"`.
+ *
+ * Strategy: walk character-by-character. When inside a string value and we
+ * encounter a `"` that is NOT followed (after optional whitespace) by `:`,
+ * `,`, `}`, or `]`, treat it as an unescaped internal quote and escape it.
+ */
+function repairLlmJson(raw: string): string {
+  const out: string[] = [];
+  let inStr = false;
+  let esc = false;
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+
+    if (esc) {
+      out.push(ch);
+      esc = false;
+      continue;
+    }
+
+    if (ch === "\\" && inStr) {
+      out.push(ch);
+      esc = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      if (!inStr) {
+        inStr = true;
+        out.push(ch);
+        continue;
+      }
+
+      // Inside a string — decide: is this the legitimate closing quote,
+      // or an unescaped internal quote?
+      // After the legitimate closing quote we always find (optional whitespace
+      // then) one of: : , } ]
+      let j = i + 1;
+      while (j < raw.length && (raw[j] === ' ' || raw[j] === '\n' || raw[j] === '\r' || raw[j] === '\t')) j++;
+      const next = raw[j];
+
+      if (next === ':' || next === ',' || next === '}' || next === ']' || j >= raw.length) {
+        // Legitimate end of string
+        inStr = false;
+        out.push(ch);
+      } else {
+        // Unescaped internal quote — escape it
+        out.push('\\');
+        out.push('"');
+      }
+      continue;
+    }
+
+    out.push(ch);
+  }
+
+  return out.join('');
+}
+
+/**
+ * Try JSON.parse; on failure, run repairLlmJson and retry.
+ * Returns the parsed value or throws with both error messages.
+ */
+function parseOrRepair(jsonStr: string): unknown {
+  try {
+    return JSON.parse(jsonStr);
+  } catch (first) {
+    try {
+      return JSON.parse(repairLlmJson(jsonStr));
+    } catch (second) {
+      const msg1 = first instanceof Error ? first.message : String(first);
+      const msg2 = second instanceof Error ? second.message : String(second);
+      throw new Error(`JSON parse failed: ${msg1} | After repair: ${msg2}`);
+    }
+  }
+}
+
 async function callLLM(prompt: string, maxTokens = 16384): Promise<unknown> {
   log("DEBUG", `LLM call (${USE_MOCK ? "MOCK" : "LIVE"}) — prompt ${prompt.length} chars, maxTokens ${maxTokens}`);
   if (USE_MOCK) return mockRouter(prompt);
@@ -984,10 +1072,10 @@ async function claudeAPI(prompt: string, maxTokens = 16384): Promise<unknown> {
       }
 
       const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (fenced) return JSON.parse(fenced[1].trim());
+      if (fenced) return parseOrRepair(fenced[1].trim());
 
       const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
-      if (raw) return JSON.parse(raw[1]);
+      if (raw) return parseOrRepair(raw[1]);
 
       throw new Error(`No JSON in LLM response: ${text.slice(0, 300)}`);
     }
@@ -6289,6 +6377,30 @@ CRITICAL rules (violating these causes errors):
 - CSS LAYOUT: Every flex/grid container must have min-width: 0 on children with text/images to prevent overflow.
   Use overflow: hidden on image wrappers.
 - CSS IMAGES: All <img> and image-wrapper elements must have a defined height (px or aspect-ratio) and object-fit: cover.
+- SVG ILLUSTRATION CONTRAST + RICHNESS (critical — prevents white-box placeholders and invisible shapes):
+  Inline SVG illustrations inside gradient-background card containers MUST follow ALL three sub-rules:
+  SUB-RULE A — NO SOLID WHITE BACKGROUND RECT: NEVER start the SVG with <rect width="100%" height="100%" fill="white"/> or any large white-filled rect as the first element. The container CSS gradient IS the background — covering it with a white rect creates a plain white box.
+  SUB-RULE B — TRANSPARENT CASING, SOLID INNER CELLS: The OUTER product shape (battery casing, box outline, product shell) MUST use fill="rgba(255,255,255,0.1)" stroke="white" stroke-width="2.5" so the gradient shows through. Only INNER content shapes (battery cells, buttons, indicators, windows) use fill="white" or fill="rgba(255,255,255,0.9)" to be solid and clearly visible.
+  SUB-RULE C — ACCENT COLOR ELEMENT: Every illustration MUST include at least one non-white accent element using a hard-coded bright color (e.g. a charge bolt in fill="#ffd700", a green indicator fill="#22c55e", or a blue-tinted glow) for visual richness. Plain white-only illustrations look flat and low-quality.
+  SUB-RULE D — MINIMUM DETAIL: Each card image SVG MUST contain at least 6 distinct visual elements (outer casing outline + inner compartment + 3+ cells/segments + 1 accent element). A single rect outline with no inner detail is NOT acceptable.
+  WRONG: <svg><rect width="100%" height="100%" fill="white"/><rect x="10%" y="20%" width="80%" height="60%" fill="gray"/></svg> — white background box with grey blob.
+  WRONG: <svg><rect x="20" y="30" width="200" height="120" fill="white" opacity="0.95"/> ...cells also white inside... </svg> — solid white casing makes entire battery look like a white rectangle.
+  CORRECT: <svg viewBox="0 0 400 280"><rect x="40" y="60" width="280" height="160" rx="16" fill="rgba(255,255,255,0.1)" stroke="white" stroke-width="2.5"/><rect x="320" y="100" width="20" height="80" rx="8" fill="rgba(255,255,255,0.6)"/><rect x="60" y="80" width="240" height="120" rx="10" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.4)" stroke-width="1"/><rect x="72" y="92" width="48" height="96" rx="6" fill="white"/><rect x="132" y="92" width="48" height="96" rx="6" fill="white" opacity="0.85"/><rect x="192" y="92" width="48" height="96" rx="6" fill="white" opacity="0.6"/><path d="M200 28 L185 58 L205 54 L188 88" stroke="#ffd700" stroke-width="4" fill="none" stroke-linecap="round"/></svg>
+- SVG SIZE IN IMAGE CONTAINERS (critical): An inline svg used as a card image placeholder MUST use width="100%" height="100%" on the svg element — NEVER fixed pixel values like width="100" height="120". Use viewBox="0 0 400 300" for 4:3, viewBox="0 0 480 270" for 16:9. The illustration content must fill at least 60% of the viewBox area.
+- ICON CARD AREA HEIGHT (critical — prevents oversized gradient banners): When using an icon-style card (small icon at top, text content below), the icon area MUST be compact and the icon MUST be large enough to fill the space.
+  CSS rule: .card-icon { padding: 20px 24px 16px; height: auto; background: gradient; display: flex; align-items: center; justify-content: center; } — use height: auto NOT min-height: 120px (min-height allows the container to grow past the icon size).
+  Icon SVG: category/feature icon SVGs in data arrays MUST be exactly width="64" height="64" viewBox="0 0 64 64". NEVER use width="16" height="16" or width="24" height="24" for category or feature icons — a 16px icon in a 120px container looks empty.
+  WRONG: .card-icon { padding: var(--spacing-2xl); min-height: 120px; } with <svg width="16" height="16"> — 16px icon in oversized 120px+ banner.
+  WRONG: .card-icon { padding: 20px 24px; min-height: 120px; } with <svg width="24" height="24"> — 24px icon still too small for 120px area.
+  CORRECT: .card-icon { padding: 20px 24px 16px; height: auto; } with <svg width="64" height="64" viewBox="0 0 64 64"> — proportional icon fills space naturally.
+- HERO VISUAL COLUMN SIZE (critical): The .section-hero__visual-svg MUST NOT have max-width: 400px — use width: 100% and max-width: 560px so it fills the column properly on desktop. The hero grid column must be align-items: stretch not center to allow the visual to fill height.
+- H1 MINIMUM SIZE (critical — prevents weak typography hierarchy): The hero section H1 MUST use font-size of minimum 3rem (48px) at desktop, scaling up to 3.5rem–4rem at wider screens. Section H2 headings must be minimum 2.25rem at desktop. NEVER generate H1 at 2rem or less — that makes the hero title the same size as body text.
+  CORRECT: h1 { font-size: 2.5rem; } @media (min-width: 768px) { h1 { font-size: 3rem; } } @media (min-width: 1024px) { h1 { font-size: 3.5rem; } }
+  Font-weight for H1 must be 800 or 900 (not 600 or 700 which looks like subheadings).
+- MOBILE GRID COLLAPSE (critical — prevents horizontal overflow on 390px viewports): Every multi-column card grid MUST have an explicit @media (max-width: 480px) block forcing grid-template-columns: 1fr. Without this, grids overflow the 390px mobile viewport horizontally.
+  Affected sections: products grid, categories grid, editorial/article grid, features grid, any CSS grid with 2+ columns.
+  CORRECT: @media (max-width: 480px) { .section-products__grid, .section-categories__grid, .section-editorial__grid, .section-features__grid { grid-template-columns: 1fr; gap: 16px; } }
+  Also: all card children must have width: 100% and max-width: 100% on mobile. Text inside cards must have overflow-wrap: break-word and hyphens: auto.
 - CSS COLORS: Never use bare hex/rgb literals for text or backgrounds — always use a CSS custom property from :root.
   Text on colored backgrounds MUST use the -foreground token (e.g. color: var(--color-primary-foreground) on primary bg).
 - TRANSITIONS: transition properties must ONLY appear inside @media (prefers-reduced-motion: no-preference) { } blocks.
@@ -6333,6 +6445,12 @@ WOOCOMMERCE RULES (default OFF):
 18. Every \`.section-X__card-image\` that contains an inline \`<svg>\` child has a matching CSS rule \`.section-X__card-svg { width: 100%; height: 100%; display: block; }\` and has NO conflicting \`::before\` pseudo-element placeholder on the same container.
 19. Hero \`::before\`/\`::after\` decorative pseudo-elements on the visual panel use \`opacity: 0.15\` or lower for texture — the primary illustration (inline SVG or gradient) is fully visible without being washed out by an overlay.
 20. Card image containers use \`aspect-ratio\` (not just fixed \`height\`) so they scale correctly at all viewport widths.
+21. Every inline \`<svg>\` illustration inside a gradient-background card DOES NOT start with a full-width white background rect (\`<rect width="100%" fill="white"/>\`). The OUTER product casing uses \`fill="rgba(255,255,255,0.1)"\` + \`stroke="white"\` (transparent with border), and only INNER cells/elements use solid \`fill="white"\`. At least one accent color element exists (yellow bolt, green indicator).
+22. No icon-card area (\`.section-X__card-icon\`, \`.card-icon\`, \`.feature-icon\`) uses \`padding: var(--spacing-2xl)\` or \`min-height: 120px\` with a tiny icon — icon areas have \`height: auto\` and category/feature icons are exactly 64×64px (NOT 16×16 or 24×24).
+23. Hero visual SVG uses \`width: 100%\` and \`max-width: 560px\` (not max-width: 400px) so it fills the hero column on wide screens.
+24. Hero H1 uses \`font-size\` of minimum \`3rem\` at desktop (not 2rem or less), with \`font-weight: 800\` or \`900\`. Section H2 headings are minimum \`2.25rem\`.
+25. Every multi-column card grid has an explicit \`@media (max-width: 480px)\` rule with \`grid-template-columns: 1fr\` — no card grid can cause horizontal overflow on a 390px mobile viewport.
+26. Card text (prices, specs, descriptions) inside mobile-collapsed cards has \`overflow-wrap: break-word\` and readable font-size (minimum 0.875rem / 14px) with sufficient contrast.
 
 Return ONLY the ${batch.length} file(s) listed above` : `[GENERATE_CODE]
 ${WORDPRESS_PRODUCTION_SYSTEM_PROMPT}
@@ -6993,10 +7111,10 @@ async function callLLMWithImages(prompt: string, imagePaths: string[], maxTokens
       }
 
       const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (fenced) return JSON.parse(fenced[1].trim());
+      if (fenced) return parseOrRepair(fenced[1].trim());
 
       const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
-      if (raw) return JSON.parse(raw[1]);
+      if (raw) return parseOrRepair(raw[1]);
 
       throw new Error(`No JSON in LLM response: ${text.slice(0, 300)}`);
     }
@@ -7047,45 +7165,28 @@ async function capturePreviewScreenshots(url: string, projectDir: string): Promi
 }
 
 async function scoreVisualQuality(ctx: SharedContext, snapshot: PreviewSnapshot): Promise<VisualScoreResponse> {
-  const prompt = `[VISUAL_SCORE]
-Evaluate this generated WordPress landing page before user review.
+  // Build brand context from analysis
+  const brandName = ctx.analysis?.brandName ?? ctx.idea ?? "";
+  const brandContext = [
+    `Brand: ${brandName}`,
+    ctx.analysis?.targetAudience ? `Audience: ${ctx.analysis.targetAudience}` : null,
+    ctx.analysis?.designDirection?.tone ? `Design tone: ${ctx.analysis.designDirection.tone}` : null,
+    ctx.analysis?.designDirection?.colorPalette ? `Color palette: ${ctx.analysis.designDirection.colorPalette}` : null,
+  ].filter(Boolean).join("\n");
 
-Return a strict visual quality score and decide whether the page should be auto-polished again.
-
-SCORING CRITERIA:
-- Layout stability and section spacing
-- Typography hierarchy and font-size balance
-- Color harmony and readability
-- Alignment, grid consistency, and CTA polish
-- Mobile responsiveness and general visual professionalism
-
-RULES:
-- Base the assessment primarily on the screenshots.
-- Use the HTML and server output only as supporting context.
-- severity must be one of: pass, polish, fail
-- pass: visually coherent and ready for review
-- polish: usable but needs one more automatic styling/layout pass
-- fail: visually broken enough that another automatic pass is required before review
-
-PREVIEW STATUS: ${snapshot.status}
-
-PREVIEW HTML:
-${clipText(snapshot.body, 8000)}
-
-PREVIEW SERVER OUTPUT:
-${clipText(snapshot.serverOutput, 2500)}
-
-Respond with JSON:
-{
-  "score": 0,
-  "desktopScore": 0,
-  "mobileScore": 0,
-  "severity": "pass",
-  "issues": ["short issue 1", "short issue 2"],
-  "explanation": "brief summary"
-}`;
-
+  const idea = ctx.idea ?? "";
+  const includeEcommerce = /woocommerce|woo\b|e-?commerce|shop|store|cart|checkout/i.test(idea);
   const imagePaths = snapshot.screenshotPaths.filter((filePath) => existsSync(filePath));
+
+  const prompt = buildQaMasterPrompt({
+    previewStatus: String(snapshot.status),
+    previewHtml: clipText(snapshot.body, 8000),
+    serverOutput: clipText(snapshot.serverOutput, 2500),
+    brandContext,
+    screenshotCount: imagePaths.length || 2,
+    includeEcommerce,
+  });
+
   const result = imagePaths.length > 0
     ? await callLLMWithImages(prompt, imagePaths, 5000)
     : await callLLM(prompt, 5000);

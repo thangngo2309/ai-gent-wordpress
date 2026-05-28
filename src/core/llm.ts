@@ -35,12 +35,43 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function repairLlmJson(raw: string): string {
+  const out: string[] = [];
+  let inStr = false;
+  let esc = false;
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (esc) { out.push(ch); esc = false; continue; }
+    if (ch === "\\" && inStr) { out.push(ch); esc = true; continue; }
+
+    if (ch === '"') {
+      if (!inStr) { inStr = true; out.push(ch); continue; }
+      let j = i + 1;
+      while (j < raw.length && (raw[j] === ' ' || raw[j] === '\n' || raw[j] === '\r' || raw[j] === '\t')) j++;
+      const next = raw[j];
+      if (next === ':' || next === ',' || next === '}' || next === ']' || j >= raw.length) {
+        inStr = false; out.push(ch);
+      } else {
+        out.push('\\'); out.push('"');
+      }
+      continue;
+    }
+    out.push(ch);
+  }
+  return out.join('');
+}
+
 function parseJsonFromText(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenced) return JSON.parse(fenced[1].trim());
+  if (fenced) {
+    try { return JSON.parse(fenced[1].trim()); } catch { return JSON.parse(repairLlmJson(fenced[1].trim())); }
+  }
 
   const raw = text.match(/(\[[\s\S]*\]|\{[\s\S]*\})/);
-  if (raw) return JSON.parse(raw[1]);
+  if (raw) {
+    try { return JSON.parse(raw[1]); } catch { return JSON.parse(repairLlmJson(raw[1])); }
+  }
 
   throw new Error(`No JSON found in LLM response: ${text.slice(0, 300)}`);
 }

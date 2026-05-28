@@ -4,6 +4,8 @@
 
 import { WORDPRESS_PRODUCTION_SYSTEM_PROMPT } from "./wordpress-system.js";
 import type { GenerationContext } from "../contracts/types.js";
+import { buildPremiumUiBlock } from "../../skills/ui/premium-ui.skill.js";
+import { buildDesignSystemCssVars } from "../../skills/ui/design-system.skill.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  THEME GENERATION PROMPT
@@ -22,6 +24,17 @@ export function buildThemeBatchPrompt(
     .map((f) => `  - ${f.filePath}: ${f.description}`)
     .join("\n");
 
+  // Use design system defaults as the CSS vars reference when no style.css has
+  // been generated yet (early batches).  This seeds the LLM with the correct
+  // token names so all template files use consistent custom property references.
+  const resolvedCssVarsBlock =
+    cssVarsBlock.trim().length > 0
+      ? cssVarsBlock
+      : `\nDesign System CSS variables (use ONLY these custom properties in all CSS):\n${buildDesignSystemCssVars()}\n`;
+
+  // Build the premium UI prompt block for this generation context
+  const premiumUiBlock = buildPremiumUiBlock(ctx);
+
   return `[GENERATE_CODE]
 ${WORDPRESS_PRODUCTION_SYSTEM_PROMPT}
 
@@ -36,8 +49,10 @@ User's idea    : "${ctx.idea}"
 Target audience: ${ctx.analysis?.targetAudience ?? "general"}
 Design tone    : ${ctx.analysis?.designDirection?.tone ?? "modern"}
 Color palette  : ${ctx.analysis?.designDirection?.colorPalette ?? "neutral"}
-${cssVarsBlock}
+${resolvedCssVarsBlock}
 ${alreadyGeneratedContext}
+
+${premiumUiBlock}
 
 Generate ONLY these files (batch ${batchIdx + 1}/${totalBatches}):
 ${fileList}
@@ -60,7 +75,11 @@ WORDPRESS THEME RULES:
 - inc/theme-data.php is the SINGLE source of demo data; prefix every function with ${actualPrefix}_
 - Data consumers (template-parts) must ONLY access keys returned by inc/theme-data.php functions
 - No remote placeholder image URLs (loremflickr, picsum, placehold, etc.)
-- Use inline SVG or CSS-generated placeholders for demo images
+- WordPress post/page thumbnails: ALWAYS use has_post_thumbnail() check before calling the_post_thumbnail() — never render a bare <img> without this guard
+- WooCommerce product cards: ALWAYS use $product->get_image('woocommerce_thumbnail') or woocommerce_template_loop_product_thumbnail() — never skip the image
+- Image containers: ALWAYS give them aspect-ratio (e.g. 4/3, 16/9) + overflow:hidden; ALWAYS apply object-fit:cover + width:100% + height:100% to the img element inside
+- SVG placeholders for missing images: NEVER use a plain gradient box — use an inline SVG illustration that fills the container (width="100%" height="100%") with a centered industry-relevant icon and subtle label text
+- Hero visual area: ALWAYS use a layered SVG composition (background shape + main SVG illustration + optional badge card) — never just a CSS gradient rectangle
 - Never use position: fixed on .site-header without compensating body padding-top
 
 NAV / JS ALIGNMENT RULE (critical — prevents broken menus):
@@ -103,6 +122,16 @@ ACCESSIBILITY:
 13. functions.php defines a {prefix}_fallback_menu() function.
 14. Every CSS selector and JS querySelector() call matches the EXACT class names in the HTML templates (three-way HTML/CSS/JS consistency). The menu_class passed to wp_nav_menu() must have a matching CSS block — do not invent a different class in the stylesheet.
 15. The mobile toggle button class in HTML matches both the CSS selector and the JS querySelector — if HTML says class="menu-toggle", CSS and JS must also use .menu-toggle.
+16. Every image container div has a CSS rule with aspect-ratio (not a fixed height) — never use height: 200px on a card image wrapper.
+17. Every img element inside a card has object-fit: cover + width: 100% + height: 100% + display: block.
+18. WooCommerce product cards use $product->get_image() or woocommerce_template_loop_product_thumbnail(), NOT a hardcoded <img> src.
+19. WordPress post/archive cards guard the thumbnail with has_post_thumbnail() before calling the_post_thumbnail().
+20. No image placeholder is a plain gradient div — every placeholder uses an inline SVG with width="100%" height="100%" and a visible icon/illustration.
+16. Hero section has gradient/colored background (NOT plain white or plain grey).
+17. Section backgrounds alternate: white ↔ var(--color-bg-secondary) throughout the page.
+18. All card image placeholders use gradient + SVG icon fallback (NOT plain grey boxes).
+19. Google Fonts (Plus Jakarta Sans + Inter) are enqueued via wp_enqueue_style() in functions.php.
+20. Primary CTA button is filled with var(--color-primary), uses border-radius: var(--radius-full).
 
 Return ONLY the ${batchFiles.length} file(s) listed above`;
 }
